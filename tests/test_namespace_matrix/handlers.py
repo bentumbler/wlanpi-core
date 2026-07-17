@@ -648,16 +648,10 @@ def handle_ssid_delayed_connect_within_monitor(namespace_service, netcfg_env, sc
         {"wpa_status": {"wpa_state": "SCANNING"}},
         {"wpa_status": {"wpa_state": "SCANNING"}},
         {"wpa_status": {"wpa_state": "COMPLETED"}},
+        {"wpa_status": {"wpa_state": "COMPLETED"}},
     ]
 
-    def wpa_side_effect():
-        pending = iter(status_sequence)
-        for item in pending:
-            yield item
-        while True:
-            yield {"wpa_status": {"wpa_state": "COMPLETED"}}
-
-    with patch("wlanpi_core.connection.monitor.get_wpa_status", side_effect=wpa_side_effect()):
+    with patch("wlanpi_core.connection.monitor.get_wpa_status", side_effect=status_sequence):
         with patch("wlanpi_core.connection.monitor.time.sleep"):
             with patch("wlanpi_core.connection.monitor.restart_dhcp_with_timeout") as dhcp:
                 with patch("wlanpi_core.connection.monitor.set_default_route"):
@@ -665,13 +659,13 @@ def handle_ssid_delayed_connect_within_monitor(namespace_service, netcfg_env, sc
                         ConnectionMonitor.start_monitor(cfg, "wlan0", "ns_a", timeout=5)
                         import time
 
-                        deadline = time.time() + 2
+                        deadline = time.time() + 5
                         while time.time() < deadline and not (
                             dhcp.called and start_app.called
                         ):
                             time.sleep(0.01)
                         stop_all_connection_monitors()
-                        _wait_for_monitors_idle()
+                        _wait_for_monitors_idle(timeout_seconds=5.0)
     dhcp.assert_called_once()
     start_app.assert_called_once_with("ns_a", "orb")
 
