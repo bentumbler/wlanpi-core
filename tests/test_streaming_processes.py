@@ -6,6 +6,7 @@ import pytest
 from wlanpi_core.models.command_result import CommandResult
 from wlanpi_core.streaming import connection_manager
 from wlanpi_core.streaming.connection_manager import ConnectionManager
+from wlanpi_core.streaming.models import CaptureConfigurations
 
 
 class BlockingStdout:
@@ -48,7 +49,24 @@ def _connected_client(manager, websocket):
         "subscribers": set(),
         "subscribed_to": None,
         "namespace": None,
+        "session_config": None,
     }
+
+
+def _configs(**by_interface):
+    """Build exactly what the endpoint hands apply_configuration()."""
+    return CaptureConfigurations.model_validate(by_interface).root
+
+
+async def _drain_channel_task(manager, websocket, iface):
+    """Await an interface's hop task so its retune has definitely happened.
+
+    Single-channel plans apply once and return, so this terminates. Awaiting
+    the task is the synchronization point; never poll the mock (AGENTS #1).
+    """
+    task = manager.clients[websocket]["channel_tasks"].get(iface)
+    if task is not None:
+        await task
 
 
 def _root_status(*ifaces):
@@ -323,6 +341,144 @@ async def test_capture_rejects_invalid_start_before_process(mocker):
         "CAPTURE_CONFIG_INVALID",
         "Invalid capture start configuration.",
     )
+
+
+async def _running_capture(manager, mocker, websocket, channels):
+    """Start a capture with mocked process/iw and settle its first retune."""
+    _mock_root_adapters(mocker, "wlanpi0")
+    process = CaptureProcess()
+    create_process = mocker.patch.object(
+        connection_manager.asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    )
+    mocker.patch.object(manager, "send_message_event", new=AsyncMock())
+    set_channel = mocker.patch.object(
+        manager, "_set_channel", new=AsyncMock(return_value=None)
+    )
+    manager.configure(websocket, "wlanpi0", {"channels": channels})
+    await manager.start_streaming(websocket, ["wlanpi0"], "")
+    if len(channels) <= 1:
+        # Multi-channel plans hop forever; only a parked one can be awaited.
+        await _drain_channel_task(manager, websocket, "wlanpi0")
+    return process, create_process, set_channel
+
+
+@pytest.mark.asyncio
+async def test_configure_mid_capture_retunes_without_restarting_capture(mocker):
+    """The point of live reconfig: the new channel is tuned while the same
+    dumpcap process keeps streaming, so the pcapng byte stream has no gap and
+    the session id survives."""
+    manager = ConnectionManager()
+    websocket = object()
+    _connected_client(manager, websocket)
+    process, create_process, set_channel = await _running_capture(
+        manager, mocker, websocket, [{"freq": 2412, "width": 20}]
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    session_id = manager.clients[websocket]["session_id"]
+    set_channel.reset_mock()
+
+    await manager.apply_configuration(
+        websocket, _configs(wlanpi0={"channels": [{"freq": 5180, "width": 80}]})
+    )
+    await _drain_channel_task(manager, websocket, "wlanpi0")
+
+    set_channel.assert_awaited_once_with("wlanpi0", 5180, 80, None)
+    assert create_process.await_count == 1
+    assert process.terminated is False
+    assert manager.clients[websocket]["session_id"] == session_id
+
+    _, _, code, data = send_event.await_args_list[-1].args
+    assert code == "CONFIG_APPLIED"
+    assert data["applied_live"] == ["wlanpi0"]
+    assert data["deferred"] == []
+    assert data["session_id"] == session_id
+
+    await manager.stop_streaming(websocket, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_configure_while_idle_is_stored_and_reported_as_deferred(mocker):
+    manager = ConnectionManager()
+    websocket = object()
+    _connected_client(manager, websocket)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        websocket, _configs(wlanpi0={"channels": [{"freq": 2412, "width": 20}]})
+    )
+
+    assert manager.clients[websocket]["channel_tasks"] == {}
+    assert manager.clients[websocket]["configs"]["wlanpi0"]["channels"] == [
+        {"freq": 2412, "width": 20}
+    ]
+    _, _, code, data = send_event.await_args_list[-1].args
+    assert code == "CONFIG_APPLIED"
+    assert data["applied_live"] == []
+    assert data["deferred"] == ["wlanpi0"]
+
+
+@pytest.mark.asyncio
+async def test_live_retune_refreshes_session_config_and_tells_subscribers(mocker):
+    """A subscriber is blind to the frames' channel plan, so it must be told
+    when the owner retunes - and list_sessions must stop advertising the old
+    config."""
+    manager = ConnectionManager()
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+    session_id = manager.clients[owner]["session_id"]
+    await manager.subscribe(subscriber, session_id)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        owner,
+        _configs(
+            wlanpi0={"channels": [{"freq": 5180, "width": 80}], "dwell_time": 500}
+        ),
+    )
+    await _drain_channel_task(manager, owner, "wlanpi0")
+
+    running = manager.clients[owner]["session_config"]["interfaces"]["wlanpi0"]
+    assert running == {"channels": [{"freq": 5180, "width": 80}], "dwell_time": 500}
+
+    changed = [
+        call for call in send_event.await_args_list if call.args[2] == "CONFIG_CHANGED"
+    ]
+    assert len(changed) == 1
+    assert changed[0].args[0] is subscriber
+    assert changed[0].args[3]["config"]["interfaces"]["wlanpi0"] == running
+    assert manager.clients[subscriber]["subscribed_to"] == session_id
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_live_retune_to_empty_channel_list_parks_the_radio(mocker):
+    """An empty channel list means "stop hopping, stay put": the hop task goes
+    away without disturbing the capture."""
+    manager = ConnectionManager()
+    websocket = object()
+    _connected_client(manager, websocket)
+    process, _, _ = await _running_capture(
+        manager,
+        mocker,
+        websocket,
+        [{"freq": 2412, "width": 20}, {"freq": 2437, "width": 20}],
+    )
+    mocker.patch.object(manager, "send_event", new=AsyncMock())
+    hop_task = manager.clients[websocket]["channel_tasks"]["wlanpi0"]
+
+    await manager.apply_configuration(websocket, _configs(wlanpi0={"channels": []}))
+
+    assert manager.clients[websocket]["channel_tasks"] == {}
+    assert hop_task.done()
+    assert process.terminated is False
+
+    await manager.stop_streaming(websocket, notify=False)
 
 
 @pytest.mark.asyncio

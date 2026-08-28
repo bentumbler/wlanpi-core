@@ -406,7 +406,38 @@ Then binary pcapng frames stream until `{ "command": "stop" }`, the socket
 closes, or the capture ends (`CAPTURE_ENDED`). Only the owning connection can
 `configure`/`stop`.
 
-### 11.3 Subscribe to someone else's capture (read-only)
+### 11.3 Retune mid-capture
+
+Send `configure` again while the capture runs to change the channel list or
+dwell of an interface it already owns — narrow the hop list once you have found
+the BSS, or park on one channel:
+
+```json
+{ "command": "configure",
+  "interfaces": { "wlanpi0": { "channels": [{"freq": 5180, "width": 80}] } } }
+```
+
+This is gapless: the capture process is never restarted, so the pcapng stream
+continues uninterrupted, the `session_id` stays the same, and subscribers stay
+attached (they get a `CONFIG_CHANGED` event carrying the new config). A single
+channel parks the radio; an empty `channels` list stops hopping and leaves the
+radio where it is.
+
+`CONFIG_APPLIED` reports exactly what happened, so you never have to guess
+whether a change is in effect yet:
+
+```json
+{ "type": "event", "event": "config", "code": "CONFIG_APPLIED",
+  "data": { "applied_live": ["wlanpi0"], "deferred": ["wlanpi1"],
+            "session_id": "cap_ab12cd34", "message": "…" } }
+```
+
+Interfaces that are not part of the running capture land in `deferred` and take
+effect at the next `start`. The interface set and `pcap_filter` are fixed when
+the capture process launches, so changing either still means `stop` then
+`start` (which ends the session and detaches subscribers).
+
+### 11.4 Subscribe to someone else's capture (read-only)
 
 Discover running captures, then attach — you do **not** need the owner's
 command or `session_id` in advance:
@@ -428,7 +459,7 @@ you are receiving), then the same binary pcapng stream arrives. A subscriber
 cannot control the capture; `{ "command": "unsubscribe" }` detaches. When the
 owner stops or disconnects, subscribers get `CAPTURE_STOPPED`/`CAPTURE_ENDED`.
 
-### 11.4 Other commands & events
+### 11.5 Other commands & events
 
 `{ "command": "get_supported_frequencies" }` → `SUPPORTED_FREQUENCIES` (channel
 list per capture adapter). Event shape:
@@ -442,7 +473,8 @@ list per capture adapter). Event shape:
 Notable codes: `AUTH_OK`, `AUTH_FAILED`, `CAPTURE_STARTED`, `CHANNEL_SET` /
 `CHANNEL_SET_FAILED` (hop status; the failure message carries the `iw` reason —
 on single-radio devices the phy can be briefly busy while the managed interface
-scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CAPTURE_STOPPED`,
+scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
+(sent to subscribers after a live retune), `CAPTURE_STOPPED`,
 `CAPTURE_ENDED`, and errors `INTERFACE_IN_USE`, `INTERFACE_NOT_AVAILABLE`,
 `SESSION_NOT_FOUND`, `CONFIG_INVALID`, `UNKNOWN_COMMAND`.
 

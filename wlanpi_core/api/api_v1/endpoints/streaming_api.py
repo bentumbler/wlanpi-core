@@ -110,6 +110,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     | `start` | `{ "interfaces": ["wlanpi0"], "pcap_filter": "…" }` | Begin streaming |
     | `stop` | `{}` | Stop capture for this client |
 
+    **Reconfiguring mid-stream:** `configure` may be sent while a capture is
+    running. Interfaces belonging to the running capture are retuned in place -
+    the channel list and dwell take effect immediately, with no gap in the
+    pcapng stream, no new `session_id`, and no disturbance to subscribers.
+    Interfaces not in the running capture are stored for the next `start`. The
+    `CONFIG_APPLIED` reply reports both sets as `applied_live` and `deferred`;
+    subscribers of a retuned capture receive `CONFIG_CHANGED`. Changing the
+    interface set or `pcap_filter` still needs `stop` then `start`, since both
+    are fixed when the capture process is launched.
+
     **Auth:** required. The first message must be
     `{ "command": "auth", "token": "<core JWT>" }` (within 10s); anything else,
     an invalid token, or a `?token=` query parameter closes the socket with
@@ -170,13 +180,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "Invalid capture interface configuration.",
                     )
                 else:
-                    for iface, config in validated_configs.root.items():
-                        manager.configure(websocket, iface, config)
-                    await manager.send_message_event(
-                        websocket,
-                        "config",
-                        "CONFIG_APPLIED",
-                        f"Configured: {', '.join(validated_configs.root.keys())}",
+                    await manager.apply_configuration(
+                        websocket, validated_configs.root
                     )
 
             elif command == "start":
