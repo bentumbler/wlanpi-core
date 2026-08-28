@@ -188,6 +188,39 @@ class ConnectionManager:
             except Exception:
                 self._detach_subscriber(subscriber)
 
+    def _start_channel_task(self, websocket: WebSocket, iface: str) -> None:
+        """Spawn the hop task for one interface from its stored config.
+
+        A config with no channels gets no task: the radio keeps whatever
+        channel it is on, which is how a client parks a hopping capture.
+        """
+        client = self.clients[websocket]
+        config = client["configs"].get(iface)
+        if not config:
+            return
+        channels = config.get("channels", [])
+        if not channels:
+            return
+        client["channel_tasks"][iface] = asyncio.create_task(
+            self._hop_channels(
+                websocket, iface, channels, config.get("dwell_time", 100)
+            )
+        )
+
+    async def _restart_channel_task(self, websocket: WebSocket, iface: str) -> None:
+        """Swap one interface's hop plan without touching the capture process."""
+        client = self.clients[websocket]
+        task = client.get("channel_tasks", {}).pop(iface, None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.debug("Channel hopping task restart failed: %s", exc)
+        self._start_channel_task(websocket, iface)
+
     async def _stop_channel_tasks(self, client: Dict[str, Any]) -> None:
         channel_tasks = list(client.get("channel_tasks", {}).values())
         client["channel_tasks"] = {}
@@ -201,11 +234,96 @@ class ConnectionManager:
             except Exception as exc:
                 log.debug("Channel hopping task shutdown failed: %s", exc)
 
-    def configure(self, websocket: WebSocket, iface: str, config: dict) -> None:
+    def configure(self, websocket: WebSocket, iface: str, config: Any) -> None:
         if websocket in self.clients:
             iface = validate_capture_interface(iface)
             validated = CaptureInterfaceConfig.model_validate(config)
             self.clients[websocket]["configs"][iface] = validated.model_dump()
+
+    @staticmethod
+    def _is_capturing(client: Dict[str, Any]) -> bool:
+        task = client.get("task")
+        proc = client.get("proc")
+        return bool((task and not task.done()) or (proc and proc.returncode is None))
+
+    @staticmethod
+    def _config_applied_message(applied_live: list, deferred: list) -> str:
+        parts = []
+        if applied_live:
+            parts.append(f"live on {', '.join(applied_live)}")
+        if deferred:
+            parts.append(f"stored for next start: {', '.join(deferred)}")
+        if not parts:
+            return "Configured."
+        return f"Configured ({'; '.join(parts)})."
+
+    def _refresh_session_config(self, client: Dict[str, Any]) -> None:
+        """Re-snapshot the running config so list_sessions and SUBSCRIBED keep
+        describing what the capture is actually doing after a live retune."""
+        session_config = client.get("session_config")
+        if not session_config:
+            return
+        session_config["interfaces"] = {
+            iface: client["configs"].get(iface, {})
+            for iface in session_config["interfaces"]
+        }
+
+    async def _notify_subscribers(
+        self, client: Dict[str, Any], code: str, data: dict
+    ) -> None:
+        for subscriber in list(client.get("subscribers", set())):
+            await self.send_event(subscriber, "status", code, data)
+
+    async def apply_configuration(
+        self, websocket: WebSocket, configs: Dict[str, CaptureInterfaceConfig]
+    ) -> None:
+        """Store a `configure` payload, applying it live where it can be.
+
+        An interface that belongs to a capture already running for this client
+        is retuned in place: only its hop task is swapped, so dumpcap keeps
+        reading the same interface and the byte stream, the session id and the
+        subscriber set all survive. Everything else is stored for the next
+        `start`. The reply says which interfaces got which treatment, because a
+        blanket "applied" on a config that only takes effect later is worse
+        than no acknowledgement at all.
+        """
+        client = self.clients.get(websocket)
+        if client is None:
+            return
+
+        for iface, config in configs.items():
+            self.configure(websocket, iface, config)
+
+        running = (
+            client.get("interfaces", set()) if self._is_capturing(client) else set()
+        )
+        applied_live = sorted(iface for iface in configs if iface in running)
+        deferred = sorted(iface for iface in configs if iface not in running)
+
+        for iface in applied_live:
+            await self._restart_channel_task(websocket, iface)
+
+        if applied_live:
+            self._refresh_session_config(client)
+            session_id = client.get("session_id")
+            if session_id:
+                await self._notify_subscribers(
+                    client,
+                    "CONFIG_CHANGED",
+                    self._session_descriptor(session_id, websocket),
+                )
+
+        await self.send_event(
+            websocket,
+            "config",
+            "CONFIG_APPLIED",
+            {
+                "message": self._config_applied_message(applied_live, deferred),
+                "applied_live": applied_live,
+                "deferred": deferred,
+                "session_id": client.get("session_id"),
+            },
+        )
 
     async def disconnect(self, websocket: WebSocket) -> None:
         self._detach_subscriber(websocket)
@@ -362,9 +480,7 @@ class ConnectionManager:
         interfaces = start.interfaces
         pcap_filter = start.pcap_filter
 
-        if (
-            client["task"] and not client["task"].done()
-        ) or (client["proc"] and client["proc"].returncode is None):
+        if self._is_capturing(client):
             await self.send_message_event(
                 websocket,
                 "error",
@@ -485,16 +601,7 @@ class ConnectionManager:
         client["channel_tasks"] = {}
 
         for iface in interfaces:
-            config = client["configs"].get(iface)
-            if not config:
-                continue
-            dwell = config.get("dwell_time", 100)
-            channels = config.get("channels", [])
-            if channels:
-                task = asyncio.create_task(
-                    self._hop_channels(websocket, iface, channels, dwell)
-                )
-                client["channel_tasks"][iface] = task
+            self._start_channel_task(websocket, iface)
 
         session_id = f"cap_{secrets.token_hex(4)}"
         client["session_id"] = session_id
