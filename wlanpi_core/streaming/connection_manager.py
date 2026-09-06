@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import re
 import secrets
 import time
@@ -23,6 +24,13 @@ from wlanpi_core.streaming.models import (
 
 log = get_logger(__name__)
 _IW_TIMEOUT_SEC = 5
+#: Why a capture stopped, sent as data.reason on CAPTURE_STOPPED so a client
+#: can tell a timer from a user stop without parsing the message.
+_STOP_MESSAGES = {
+    "OWNER_STOP": "Capture stopped.",
+    "OWNER_DISCONNECT": "Capture stopped: owner disconnected.",
+    "DURATION_ELAPSED": "Capture stopped: duration elapsed.",
+}
 
 
 class ConnectionManager:
@@ -35,6 +43,9 @@ class ConnectionManager:
         # Monotonic clock for session lifetime. An attribute so tests inject a
         # fake instead of patching `time` (AGENTS #7: that is process-global).
         self._clock = time.monotonic
+        # Same reason: the duration timer sleeps through this, so a test can
+        # release it on an event instead of waiting out the wall clock.
+        self._sleep = asyncio.sleep
 
     async def connect(self, websocket: WebSocket) -> None:
         self.clients[websocket] = {
@@ -47,6 +58,9 @@ class ConnectionManager:
             "session_id": None,
             "session_config": None,
             "started_mono": None,
+            "duration_sec": None,
+            "deadline_task": None,
+            "stop_reason": None,
             "namespace": None,
             "subscribers": set(),
             "subscribed_to": None,
@@ -107,13 +121,34 @@ class ConnectionManager:
             if owner_client:
                 owner_client["subscribers"].discard(websocket)
 
-    async def _end_session(self, client: Dict[str, Any], code: str, message: str) -> None:
+    def _cancel_deadline(self, client: Dict[str, Any]) -> None:
+        """Disarm a bounded capture's timer. Never cancels the current task:
+        when the timer itself is the one stopping the capture, cancelling it
+        would abort that very teardown at its next await."""
+        task = client.get("deadline_task")
+        client["deadline_task"] = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _expire_after(self, websocket: WebSocket, duration_sec: int) -> None:
+        await self._sleep(duration_sec)
+        client = self.clients.get(websocket)
+        if client is None or client.get("deadline_task") is not asyncio.current_task():
+            return  # already stopped by another path; nothing to do
+        await self.stop_streaming(websocket, reason="DURATION_ELAPSED")
+
+    async def _end_session(
+        self, client: Dict[str, Any], code: str, message: str, reason: str
+    ) -> None:
         """Unregister a finished capture and notify/detach its subscribers.
         Idempotent: safe to call from both stream teardown and stop paths."""
+        self._cancel_deadline(client)
         session_id = client.get("session_id")
         client["session_id"] = None
         client["session_config"] = None
         client["started_mono"] = None
+        client["duration_sec"] = None
+        client["stop_reason"] = None
         client["namespace"] = None
         if session_id:
             self.sessions.pop(session_id, None)
@@ -122,7 +157,9 @@ class ConnectionManager:
             if sub_client:
                 sub_client["subscribed_to"] = None
             client["subscribers"].discard(subscriber)
-            await self.send_message_event(subscriber, "status", code, message)
+            await self.send_event(
+                subscriber, "status", code, {"message": message, "reason": reason}
+            )
 
     def _lifetime_fields(self, client: Dict[str, Any]) -> dict:
         """How long the capture has run and, when it is bounded, how long is
@@ -130,10 +167,20 @@ class ConnectionManager:
         seconds. A perpetual capture reports null duration/remaining rather
         than inventing an end it does not have."""
         started = client.get("started_mono")
-        elapsed = None
+        duration = client.get("duration_sec")
+        elapsed = remaining = None
         if started is not None:
-            elapsed = max(0, int(self._clock() - started))
-        return {"elapsed_sec": elapsed, "duration_sec": None, "remaining_sec": None}
+            now = self._clock()
+            elapsed = max(0, int(now - started))
+            if duration is not None:
+                # Ceiling, so a capture that has just started says "60 left",
+                # not 59, and elapsed + remaining add up to the duration.
+                remaining = max(0, math.ceil(started + duration - now))
+        return {
+            "elapsed_sec": elapsed,
+            "duration_sec": duration,
+            "remaining_sec": remaining,
+        }
 
     def _session_descriptor(self, session_id: str, owner_ws: WebSocket) -> dict:
         """Public description of a running capture: who owns it, the exact
@@ -347,7 +394,7 @@ class ConnectionManager:
     async def disconnect(self, websocket: WebSocket) -> None:
         self._detach_subscriber(websocket)
         try:
-            await self.stop_streaming(websocket)
+            await self.stop_streaming(websocket, reason="OWNER_DISCONNECT")
         except Exception as e:
             log.warning(f"disconnect() failed: {e!r}")
         self.clients.pop(websocket, None)
@@ -472,6 +519,7 @@ class ConnectionManager:
         websocket: WebSocket,
         interfaces: list[str],
         pcap_filter: str,
+        duration_sec: Optional[int] = None,
     ) -> None:
         client = self.clients.get(websocket)
         if not client:
@@ -487,6 +535,7 @@ class ConnectionManager:
             start = CaptureStart(
                 interfaces=interfaces,
                 pcap_filter=pcap_filter,
+                duration_sec=duration_sec,
             )
         except ValueError:
             await self.send_message_event(
@@ -593,8 +642,11 @@ class ConnectionManager:
                     if not chunk:
                         break
                     await self._broadcast_chunk(websocket, client, chunk)
-                await self.send_message_event(
-                    websocket, "status", "CAPTURE_ENDED", "Capture ended."
+                await self.send_event(
+                    websocket,
+                    "status",
+                    "CAPTURE_ENDED",
+                    {"message": "Capture ended.", "reason": "PROCESS_EXITED"},
                 )
             except asyncio.CancelledError:
                 raise
@@ -609,7 +661,21 @@ class ConnectionManager:
                 await terminate_process_async(proc)
                 await self._stop_channel_tasks(client)
                 self._release_interfaces(websocket)
-                await self._end_session(client, "CAPTURE_ENDED", "Capture ended.")
+                # A stop path cancels this task before the process has exited;
+                # it records why, so subscribers hear CAPTURE_STOPPED with that
+                # reason rather than a misleading CAPTURE_ENDED.
+                stop_reason = client.get("stop_reason")
+                if stop_reason:
+                    await self._end_session(
+                        client,
+                        "CAPTURE_STOPPED",
+                        _STOP_MESSAGES.get(stop_reason, "Capture stopped."),
+                        stop_reason,
+                    )
+                else:
+                    await self._end_session(
+                        client, "CAPTURE_ENDED", "Capture ended.", "PROCESS_EXITED"
+                    )
                 if client.get("proc") is proc:
                     client["proc"] = None
                 if client.get("task") is asyncio.current_task():
@@ -625,6 +691,13 @@ class ConnectionManager:
         session_id = f"cap_{secrets.token_hex(4)}"
         client["session_id"] = session_id
         client["started_mono"] = self._clock()
+        client["duration_sec"] = start.duration_sec
+        if start.duration_sec is not None:
+            # Core keeps the deadline so it holds even if the owner never
+            # sends stop; the timer goes through the normal stop path.
+            client["deadline_task"] = asyncio.create_task(
+                self._expire_after(websocket, start.duration_sec)
+            )
         # Snapshot the exact running config so list_sessions / SUBSCRIBED can
         # report it to subscribers (who otherwise only see raw frames).
         client["session_config"] = {
@@ -648,14 +721,21 @@ class ConnectionManager:
             },
         )
 
-    async def stop_streaming(self, websocket: WebSocket, notify: bool = True) -> None:
+    async def stop_streaming(
+        self,
+        websocket: WebSocket,
+        notify: bool = True,
+        reason: str = "OWNER_STOP",
+    ) -> None:
         client = self.clients.get(websocket)
         if not client:
             return
 
+        self._cancel_deadline(client)
         task = client.get("task")
         proc = client.get("proc")
         if task:
+            client["stop_reason"] = reason
             task.cancel()
 
         if task:
@@ -671,15 +751,19 @@ class ConnectionManager:
 
         await self._stop_channel_tasks(client)
         self._release_interfaces(websocket)
-        await self._end_session(client, "CAPTURE_STOPPED", "Capture stopped.")
+        message = _STOP_MESSAGES.get(reason, "Capture stopped.")
+        await self._end_session(client, "CAPTURE_STOPPED", message, reason)
 
         client["task"] = None
         client["proc"] = None
 
         if notify:
             try:
-                await self.send_message_event(
-                    websocket, "status", "CAPTURE_STOPPED", "Capture stopped."
+                await self.send_event(
+                    websocket,
+                    "status",
+                    "CAPTURE_STOPPED",
+                    {"message": message, "reason": reason},
                 )
             except Exception:
                 pass

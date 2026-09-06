@@ -6,7 +6,11 @@ import pytest
 from wlanpi_core.models.command_result import CommandResult
 from wlanpi_core.streaming import connection_manager
 from wlanpi_core.streaming.connection_manager import ConnectionManager
-from wlanpi_core.streaming.models import CaptureConfigurations
+from wlanpi_core.streaming.models import (
+    MAX_CAPTURE_DURATION_SEC,
+    CaptureConfigurations,
+    CaptureStart,
+)
 
 
 class BlockingStdout:
@@ -50,6 +54,10 @@ def _connected_client(manager, websocket):
         "subscribed_to": None,
         "namespace": None,
         "session_config": None,
+        "started_mono": None,
+        "duration_sec": None,
+        "deadline_task": None,
+        "stop_reason": None,
     }
 
 
@@ -343,7 +351,7 @@ async def test_capture_rejects_invalid_start_before_process(mocker):
     )
 
 
-async def _running_capture(manager, mocker, websocket, channels):
+async def _running_capture(manager, mocker, websocket, channels, duration_sec=None):
     """Start a capture with mocked process/iw and settle its first retune."""
     _mock_root_adapters(mocker, "wlanpi0")
     process = CaptureProcess()
@@ -357,7 +365,7 @@ async def _running_capture(manager, mocker, websocket, channels):
         manager, "_set_channel", new=AsyncMock(return_value=None)
     )
     manager.configure(websocket, "wlanpi0", {"channels": channels})
-    await manager.start_streaming(websocket, ["wlanpi0"], "")
+    await manager.start_streaming(websocket, ["wlanpi0"], "", duration_sec)
     if len(channels) <= 1:
         # Multi-channel plans hop forever; only a parked one can be awaited.
         await _drain_channel_task(manager, websocket, "wlanpi0")
@@ -600,3 +608,230 @@ async def test_session_list_and_subscribed_carry_lifetime_fields(mocker):
     assert subscribed.args[3]["duration_sec"] is None
 
     await manager.stop_streaming(owner, notify=False)
+
+
+# --- Bounded captures: duration_sec on start (P6.3) -------------------------
+
+
+class _FakeSleep:
+    """Injected as manager._sleep. Records the requested delay and blocks
+    until the test releases it, so expiry is driven by an event and never by
+    the wall clock (AGENTS #1)."""
+
+    def __init__(self):
+        self.delays = []
+        self.release = asyncio.Event()
+
+    async def __call__(self, delay):
+        self.delays.append(delay)
+        await self.release.wait()
+
+
+class EndingStdout:
+    """A capture process whose output ends as soon as it is read: the
+    dumpcap-exited path."""
+
+    async def read(self, size):
+        return b""
+
+
+def _events(send_event, code):
+    return [call for call in send_event.await_args_list if call.args[2] == code]
+
+
+@pytest.mark.parametrize("value", [None, 1, 300, MAX_CAPTURE_DURATION_SEC])
+def test_capture_start_accepts_valid_duration(value):
+    start = CaptureStart(interfaces=["wlanpi0"], duration_sec=value)
+    assert start.duration_sec == value
+
+
+@pytest.mark.parametrize(
+    "value", [0, -1, MAX_CAPTURE_DURATION_SEC + 1, True, 5.5, "300"]
+)
+def test_capture_start_rejects_invalid_duration(value):
+    with pytest.raises(ValueError):
+        CaptureStart(interfaces=["wlanpi0"], duration_sec=value)
+
+
+@pytest.mark.asyncio
+async def test_start_without_duration_is_perpetual(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+
+    client = manager.clients[owner]
+    assert client["deadline_task"] is None
+    assert manager._sleep.delays == []
+    lifetime = manager._lifetime_fields(client)
+    assert lifetime["duration_sec"] is None
+    assert lifetime["remaining_sec"] is None
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_invalid_duration_is_rejected_before_any_process_starts(mocker):
+    manager = ConnectionManager()
+    owner = object()
+    _connected_client(manager, owner)
+    _mock_root_adapters(mocker, "wlanpi0")
+    create_process = mocker.patch.object(
+        connection_manager.asyncio, "create_subprocess_exec", new=AsyncMock()
+    )
+    send_message_event = mocker.patch.object(
+        manager, "send_message_event", new=AsyncMock()
+    )
+    manager.configure(owner, "wlanpi0", {"channels": [{"freq": 2412, "width": 20}]})
+
+    await manager.start_streaming(owner, ["wlanpi0"], "", 0)
+
+    create_process.assert_not_awaited()
+    assert send_message_event.await_args.args[2] == "CAPTURE_CONFIG_INVALID"
+    assert manager.interface_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_bounded_capture_reports_duration_and_remaining(mocker):
+    manager = ConnectionManager()
+    clock = _FakeClock(100.0)
+    manager._clock = clock
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=300
+    )
+    session_id = manager.clients[owner]["session_id"]
+
+    (started,) = _events(send_event, "CAPTURE_STARTED")
+    assert started.args[3]["duration_sec"] == 300
+    assert started.args[3]["remaining_sec"] == 300
+    assert manager._sleep.delays == [300]
+
+    clock.now = 220.5
+    descriptor = manager._session_descriptor(session_id, owner)
+    assert descriptor["elapsed_sec"] == 120
+    assert descriptor["duration_sec"] == 300
+    assert descriptor["remaining_sec"] == 180
+
+    clock.now = 1000.0
+    assert manager._session_descriptor(session_id, owner)["remaining_sec"] == 0
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_duration_elapsed_stops_capture_and_tells_owner_and_subscriber(
+    mocker,
+):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=5
+    )
+    session_id = manager.clients[owner]["session_id"]
+    await manager.subscribe(subscriber, session_id)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    sleep.release.set()
+    await deadline_task
+
+    assert process.terminated is True
+    assert manager.sessions == {}
+    assert manager.interface_owners == {}
+    assert manager.clients[owner]["deadline_task"] is None
+    assert manager.clients[subscriber]["subscribed_to"] is None
+    stopped = _events(send_event, "CAPTURE_STOPPED")
+    assert {call.args[0] for call in stopped} == {owner, subscriber}
+    assert all(call.args[3]["reason"] == "DURATION_ELAPSED" for call in stopped)
+
+
+@pytest.mark.asyncio
+async def test_manual_stop_cancels_the_duration_timer(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    _connected_client(manager, owner)
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    await manager.stop_streaming(owner)
+
+    with pytest.raises(asyncio.CancelledError):
+        await deadline_task
+    assert manager.clients[owner]["deadline_task"] is None
+    (stopped,) = _events(send_event, "CAPTURE_STOPPED")
+    assert stopped.args[3]["reason"] == "OWNER_STOP"
+    # Releasing the sleep afterwards must not produce a second stop.
+    sleep.release.set()
+    await asyncio.sleep(0)
+    assert len(_events(send_event, "CAPTURE_STOPPED")) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_disconnect_reports_reason_to_subscribers(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    await manager.subscribe(subscriber, manager.clients[owner]["session_id"])
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    await manager.disconnect(owner)
+
+    assert deadline_task.cancelled() or deadline_task.done()
+    assert owner not in manager.clients
+    stopped = [
+        c for c in _events(send_event, "CAPTURE_STOPPED") if c.args[0] is subscriber
+    ]
+    assert len(stopped) == 1
+    assert stopped[0].args[3]["reason"] == "OWNER_DISCONNECT"
+
+
+@pytest.mark.asyncio
+async def test_process_exit_cancels_the_duration_timer(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    _mock_root_adapters(mocker, "wlanpi0")
+    process = CaptureProcess()
+    process.stdout = EndingStdout()
+    mocker.patch.object(
+        connection_manager.asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    )
+    mocker.patch.object(manager, "_set_channel", new=AsyncMock(return_value=None))
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    manager.configure(owner, "wlanpi0", {"channels": [{"freq": 2412, "width": 20}]})
+
+    await manager.start_streaming(owner, ["wlanpi0"], "", 60)
+    deadline_task = manager.clients[owner]["deadline_task"]
+    await manager.clients[owner]["task"]
+
+    assert manager.clients[owner]["deadline_task"] is None
+    with pytest.raises(asyncio.CancelledError):
+        await deadline_task
+    (ended,) = _events(send_event, "CAPTURE_ENDED")
+    assert ended.args[3]["reason"] == "PROCESS_EXITED"
+    assert manager.sessions == {}
