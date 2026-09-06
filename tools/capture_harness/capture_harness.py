@@ -462,6 +462,19 @@ def _print_config(config: Optional[dict]) -> None:
         print(f"  filter: {config['pcap_filter']}")
 
 
+def _print_lifetime(desc: Optional[dict]) -> None:
+    """elapsed / duration / remaining from a session descriptor (P6.2+)."""
+    if not desc or desc.get("elapsed_sec") is None:
+        return
+    line = f"  running for {desc['elapsed_sec']}s"
+    if desc.get("duration_sec") is not None:
+        line += (f", bounded to {desc['duration_sec']}s "
+                 f"({desc.get('remaining_sec')}s left)")
+    else:
+        line += ", perpetual (until the owner stops)"
+    print(line)
+
+
 async def _find_sessions(ws) -> list:
     await ws.send(json.dumps({"command": "list_sessions"}))
     while True:
@@ -590,6 +603,7 @@ async def run_subscriber(args) -> None:
                 print(f"  session {session_id} owned by "
                       f"did={data.get('owner')} in namespace {ns}")
                 _print_config(data.get("config"))
+                _print_lifetime(data)
                 print("=" * 60)
                 break
             if event.get("event") == "error":
@@ -628,6 +642,7 @@ async def run_list(args) -> None:
                         f"interfaces={','.join(sess.get('interfaces', []))}"
                     )
                     _print_config(sess.get("config"))
+                    _print_lifetime(sess)
                 return
 
 

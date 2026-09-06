@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import secrets
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import WebSocket
@@ -31,6 +32,9 @@ class ConnectionManager:
         # Running captures by session id -> owning WebSocket. Sessions exist
         # so other authenticated principals can subscribe read-only (#141).
         self.sessions: Dict[str, WebSocket] = {}
+        # Monotonic clock for session lifetime. An attribute so tests inject a
+        # fake instead of patching `time` (AGENTS #7: that is process-global).
+        self._clock = time.monotonic
 
     async def connect(self, websocket: WebSocket) -> None:
         self.clients[websocket] = {
@@ -42,6 +46,7 @@ class ConnectionManager:
             "did": None,
             "session_id": None,
             "session_config": None,
+            "started_mono": None,
             "namespace": None,
             "subscribers": set(),
             "subscribed_to": None,
@@ -108,6 +113,7 @@ class ConnectionManager:
         session_id = client.get("session_id")
         client["session_id"] = None
         client["session_config"] = None
+        client["started_mono"] = None
         client["namespace"] = None
         if session_id:
             self.sessions.pop(session_id, None)
@@ -118,10 +124,22 @@ class ConnectionManager:
             client["subscribers"].discard(subscriber)
             await self.send_message_event(subscriber, "status", code, message)
 
+    def _lifetime_fields(self, client: Dict[str, Any]) -> dict:
+        """How long the capture has run and, when it is bounded, how long is
+        left. Computed at send time from the monotonic clock, as integer
+        seconds. A perpetual capture reports null duration/remaining rather
+        than inventing an end it does not have."""
+        started = client.get("started_mono")
+        elapsed = None
+        if started is not None:
+            elapsed = max(0, int(self._clock() - started))
+        return {"elapsed_sec": elapsed, "duration_sec": None, "remaining_sec": None}
+
     def _session_descriptor(self, session_id: str, owner_ws: WebSocket) -> dict:
-        """Public description of a running capture: who owns it and the exact
-        config it is running (channels/width/dwell per interface + filter), so
-        a subscriber is never blind to what it is receiving."""
+        """Public description of a running capture: who owns it, the exact
+        config it is running (channels/width/dwell per interface + filter) and
+        how long it has been running, so a subscriber is never blind to what
+        it is receiving."""
         owner_client = self.clients.get(owner_ws, {})
         return {
             "session_id": session_id,
@@ -129,6 +147,7 @@ class ConnectionManager:
             "interfaces": sorted(owner_client.get("interfaces", set())),
             "namespace": owner_client.get("namespace"),
             "config": owner_client.get("session_config"),
+            **self._lifetime_fields(owner_client),
         }
 
     async def subscribe(self, websocket: WebSocket, session_id: Optional[str]) -> None:
@@ -605,6 +624,7 @@ class ConnectionManager:
 
         session_id = f"cap_{secrets.token_hex(4)}"
         client["session_id"] = session_id
+        client["started_mono"] = self._clock()
         # Snapshot the exact running config so list_sessions / SUBSCRIBED can
         # report it to subscribers (who otherwise only see raw frames).
         client["session_config"] = {
@@ -624,6 +644,7 @@ class ConnectionManager:
                 "session_id": session_id,
                 "interfaces": sorted(interfaces),
                 "config": client["session_config"],
+                **self._lifetime_fields(client),
             },
         )
 

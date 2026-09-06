@@ -44,7 +44,7 @@ timeout / a token in the URL). After that:
 | `stop` | `{}` | owner only |
 | `subscribe` | `{"session_id": "cap_xxxx"}` | listen read-only to another socket's capture |
 | `unsubscribe` | `{}` | detach |
-| `list_sessions` | `{}` | enumerate running captures **with their running config** |
+| `list_sessions` | `{}` | enumerate running captures **with their running config** and lifetime (`elapsed_sec`, `duration_sec`, `remaining_sec`) |
 
 Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
 
@@ -99,8 +99,10 @@ an existing one, and it must tell its caller which it did.
 
 1. Send `list_sessions`. Each returned session carries `session_id`, `owner`
    (the did), `interfaces`, `namespace` (which netns the capture runs in;
-   `null` for root), and the full running `config` (per-interface
-   channels/width/dwell + `pcap_filter`).
+   `null` for root), the full running `config` (per-interface
+   channels/width/dwell + `pcap_filter`), and its lifetime: `elapsed_sec`
+   (integer seconds so far), `duration_sec` and `remaining_sec` (`null` for a
+   perpetual capture, i.e. one that runs until its owner stops it).
 2. If a session already captures on the interface MCP wants:
    - MCP **cannot** also own that interface — a `start` will fail with
      `INTERFACE_IN_USE`. So MCP either subscribes to observe it, or reports the
