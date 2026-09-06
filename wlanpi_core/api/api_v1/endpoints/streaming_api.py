@@ -129,7 +129,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     `CAPTURE_STARTED` event. Any other authenticated connection may
     `{ "command": "subscribe", "session_id": … }` to receive the same binary
     stream read-only (`list_sessions` enumerates running captures); only the
-    owning connection can `configure`/`stop`. `unsubscribe` detaches.
+    owning connection can `configure`/`stop`. `unsubscribe` detaches. Session
+    descriptors (`SESSIONS`, `SUBSCRIBED`, `CAPTURE_STARTED`) carry the running
+    `config` plus `elapsed_sec`; `duration_sec`/`remaining_sec` are `null` for
+    a perpetual capture.
 
     **Long-running:** keep connection open for entire capture session; use `stop` before disconnect.
 

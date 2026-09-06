@@ -401,7 +401,8 @@ An invalid/expired token, a non-auth first message, or a timeout closes 4401.
 `width` ∈ {20,40,80,160}; `dwell_time` 50–60000 ms. Interface names are the
 monitor VIFs (`wlanpiN`); core runs the capture in whatever namespace the
 adapter lives in. `start` replies `CAPTURE_STARTED` with a `session_id`
-(`cap_xxxx`), the `interfaces`, the `namespace`, and the running `config`.
+(`cap_xxxx`), the `interfaces`, the `namespace`, the running `config`, and the
+lifetime fields (`elapsed_sec`, `duration_sec`, `remaining_sec`).
 Then binary pcapng frames stream until `{ "command": "stop" }`, the socket
 closes, or the capture ends (`CAPTURE_ENDED`). Only the owning connection can
 `configure`/`stop`.
@@ -447,15 +448,18 @@ command or `session_id` in advance:
 ```
 
 Reply `SESSIONS` lists each capture with `session_id`, `owner`, `interfaces`,
-`namespace`, and `config`. Pick the one on the interface you want (one owner
-per interface) and:
+`namespace`, `config`, and how long it has run: `elapsed_sec` (integer seconds,
+computed when the event is sent), plus `duration_sec` and `remaining_sec`,
+which are `null` for a perpetual capture (one that runs until the owner stops
+it). Pick the one on the interface you want (one owner per interface) and:
 
 ```json
 { "command": "subscribe", "session_id": "cap_ab12cd34" }
 ```
 
-`SUBSCRIBED` returns that session's `config` (so you know the channels/filter
-you are receiving), then the same binary pcapng stream arrives. A subscriber
+`SUBSCRIBED` returns that session's full descriptor: the `config` (so you know
+the channels/filter you are receiving) and the lifetime fields (so you know how
+long it has been running), then the same binary pcapng stream arrives. A subscriber
 cannot control the capture; `{ "command": "unsubscribe" }` detaches. When the
 owner stops or disconnects, subscribers get `CAPTURE_STOPPED`/`CAPTURE_ENDED`.
 
