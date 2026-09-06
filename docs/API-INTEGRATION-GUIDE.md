@@ -469,9 +469,38 @@ it). Pick the one on the interface you want (one owner per interface) and:
 the channels/filter you are receiving) and the lifetime fields (so you know how
 long it has been running), then the same binary pcapng stream arrives. A subscriber
 cannot control the capture; `{ "command": "unsubscribe" }` detaches. When the
-owner stops or disconnects, subscribers get `CAPTURE_STOPPED`/`CAPTURE_ENDED`.
+capture ends for any reason, subscribers get `CAPTURE_STOPPED` (with
+`data.reason`) or `CAPTURE_ENDED`.
 
-### 11.5 Other commands & events
+### 11.5 Bounded and detached captures
+
+A **perpetual** capture (no `duration_sec`) lives with its owner's socket:
+when that socket closes the capture stops at once, subscribers or not, because
+nobody else could stop or retune it.
+
+A **bounded** capture (`duration_sec` set) belongs to the owner's `did`, not
+to the socket. If the owner's socket closes, the capture keeps running for
+whoever is listening — the descriptor then shows `"owner_attached": false` and
+a `subscriber_count` — and ends when one of these happens first:
+
+| End | Reason on `CAPTURE_STOPPED` |
+|---|---|
+| the deadline is reached | `DURATION_ELAPSED` |
+| `{ "command": "stop", "session_id": "cap_…" }` from any connection authenticated as the owner's `did` | `OWNER_STOP` |
+| nobody has been attached (owner or subscriber) for a short grace period (15 s) | `NO_LISTENERS` |
+
+This is what makes "start a bounded capture, hand it to a child process that
+subscribes and saves the stream, exit" work: the child subscribes within the
+grace window and the capture runs to its deadline. A capture with no listeners
+is not kept alive — the radio would be hopping into nowhere. Another
+connection with a different `did` asking to stop it gets `SESSION_NOT_OWNED`.
+
+While a detached capture holds an interface, a new `start` on that interface
+fails with `INTERFACE_IN_USE` as usual; stop the old session by `session_id`
+first (or subscribe to it instead — a reconnected owner may subscribe to its
+own detached session).
+
+### 11.6 Other commands & events
 
 `{ "command": "get_supported_frequencies" }` → `SUPPORTED_FREQUENCIES` (channel
 list per capture adapter). Event shape:
@@ -487,8 +516,9 @@ Notable codes: `AUTH_OK`, `AUTH_FAILED`, `CAPTURE_STARTED`, `CHANNEL_SET` /
 on single-radio devices the phy can be briefly busy while the managed interface
 scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
 (sent to subscribers after a live retune), `CAPTURE_STOPPED` /
-`CAPTURE_ENDED` (with `data.reason`, see 11.2), and errors `INTERFACE_IN_USE`,
-`INTERFACE_NOT_AVAILABLE`, `SESSION_NOT_FOUND`, `CONFIG_INVALID`,
+`CAPTURE_ENDED` (with `data.reason`, see 11.2 and 11.5), and errors
+`INTERFACE_IN_USE`, `INTERFACE_NOT_AVAILABLE`, `SESSION_NOT_FOUND`,
+`SESSION_NOT_OWNED`, `CONFIG_INVALID`,
 `CAPTURE_CONFIG_INVALID` (bad `start`, e.g. `duration_sec` out of range),
 `UNKNOWN_COMMAND`.
 

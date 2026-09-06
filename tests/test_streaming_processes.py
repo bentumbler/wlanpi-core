@@ -615,16 +615,23 @@ async def test_session_list_and_subscribed_carry_lifetime_fields(mocker):
 
 class _FakeSleep:
     """Injected as manager._sleep. Records the requested delay and blocks
-    until the test releases it, so expiry is driven by an event and never by
-    the wall clock (AGENTS #1)."""
+    until the test releases that delay, so expiry is driven by an event and
+    never by the wall clock (AGENTS #1). Keyed by delay because a detached
+    bounded capture has two sleepers: the deadline and the orphan grace."""
 
     def __init__(self):
         self.delays = []
-        self.release = asyncio.Event()
+        self._events = {}
+
+    def release(self, delay):
+        self.event_for(delay).set()
+
+    def event_for(self, delay):
+        return self._events.setdefault(delay, asyncio.Event())
 
     async def __call__(self, delay):
         self.delays.append(delay)
-        await self.release.wait()
+        await self.event_for(delay).wait()
 
 
 class EndingStdout:
@@ -742,7 +749,7 @@ async def test_duration_elapsed_stops_capture_and_tells_owner_and_subscriber(
     send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
     deadline_task = manager.clients[owner]["deadline_task"]
 
-    sleep.release.set()
+    sleep.release(5)
     await deadline_task
 
     assert process.terminated is True
@@ -776,30 +783,32 @@ async def test_manual_stop_cancels_the_duration_timer(mocker):
     (stopped,) = _events(send_event, "CAPTURE_STOPPED")
     assert stopped.args[3]["reason"] == "OWNER_STOP"
     # Releasing the sleep afterwards must not produce a second stop.
-    sleep.release.set()
+    sleep.release(60)
     await asyncio.sleep(0)
     assert len(_events(send_event, "CAPTURE_STOPPED")) == 1
 
 
 @pytest.mark.asyncio
-async def test_owner_disconnect_reports_reason_to_subscribers(mocker):
+async def test_perpetual_capture_dies_with_its_owner_and_says_so(mocker):
+    """No duration_sec: nobody else could stop or retune it, so the owner's
+    disconnect ends it even with a subscriber attached."""
     manager = ConnectionManager()
     manager._sleep = _FakeSleep()
     owner = object()
     subscriber = object()
     _connected_client(manager, owner)
     _connected_client(manager, subscriber)
-    await _running_capture(
-        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}]
     )
     await manager.subscribe(subscriber, manager.clients[owner]["session_id"])
     send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
-    deadline_task = manager.clients[owner]["deadline_task"]
 
     await manager.disconnect(owner)
 
-    assert deadline_task.cancelled() or deadline_task.done()
+    assert process.terminated is True
     assert owner not in manager.clients
+    assert manager.sessions == {}
     stopped = [
         c for c in _events(send_event, "CAPTURE_STOPPED") if c.args[0] is subscriber
     ]
@@ -835,3 +844,220 @@ async def test_process_exit_cancels_the_duration_timer(mocker):
     (ended,) = _events(send_event, "CAPTURE_ENDED")
     assert ended.args[3]["reason"] == "PROCESS_EXITED"
     assert manager.sessions == {}
+
+
+# --- Detached bounded captures (P6.4) ---------------------------------------
+
+
+class _Sock:
+    """Hashable socket stand-in with the two send methods the manager uses."""
+
+    def __init__(self):
+        self.send_bytes = AsyncMock()
+        self.send_text = AsyncMock()
+
+
+async def _detached_capture(manager, mocker, duration_sec=60, subscriber=None):
+    """A bounded capture whose owner socket has gone away."""
+    owner = _Sock()
+    _connected_client(manager, owner)
+    manager.clients[owner]["did"] = "owner-did"
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec
+    )
+    session_id = manager.clients[owner]["session_id"]
+    if subscriber is not None:
+        _connected_client(manager, subscriber)
+        await manager.subscribe(subscriber, session_id)
+    await manager.disconnect(owner)
+    await asyncio.sleep(0)  # let a freshly armed orphan watch reach its sleep
+    return owner, process, session_id
+
+
+@pytest.mark.asyncio
+async def test_bounded_capture_survives_owner_disconnect_while_subscribed(mocker):
+    """The point of P6.4: start bounded, hand the stream to a subscriber (a
+    saver process), disconnect - the capture and its subscriber carry on."""
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    manager._clock = _FakeClock(0.0)
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    client = manager.clients[owner]
+
+    assert process.terminated is False
+    assert manager.sessions == {session_id: owner}
+    assert client["owner_attached"] is False
+    assert client["orphan_task"] is None  # a listener is attached
+    descriptor = manager._session_descriptor(session_id, owner)
+    assert descriptor["owner_attached"] is False
+    assert descriptor["subscriber_count"] == 1
+    assert descriptor["remaining_sec"] == 60
+
+    await manager._broadcast_chunk(owner, client, b"pcapng")
+    subscriber.send_bytes.assert_awaited_once_with(b"pcapng")
+    owner.send_bytes.assert_not_awaited()
+
+    # Nothing is sent to the socket that is no longer there.
+    owner.send_text.reset_mock()
+    await manager.send_event(owner, "status", "X", {})
+    owner.send_text.assert_not_awaited()
+
+    await manager.stop_streaming(owner, notify=False)
+    assert owner not in manager.clients
+    assert manager.interface_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_detached_capture_with_no_listeners_stops_after_grace(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner, process, session_id = await _detached_capture(manager, mocker)
+    orphan_task = manager.clients[owner]["orphan_task"]
+
+    assert orphan_task is not None
+    assert connection_manager.ORPHAN_GRACE_SEC in sleep.delays
+    assert process.terminated is False  # not immediately: the grace is the point
+
+    sleep.release(connection_manager.ORPHAN_GRACE_SEC)
+    await orphan_task
+
+    assert process.terminated is True
+    assert owner not in manager.clients
+    assert manager.sessions == {}
+    assert manager.interface_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_subscribe_within_grace_cancels_orphan_timer(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner, process, session_id = await _detached_capture(manager, mocker)
+    orphan_task = manager.clients[owner]["orphan_task"]
+    late_child = _Sock()
+    _connected_client(manager, late_child)
+
+    await manager.subscribe(late_child, session_id)
+
+    assert manager.clients[owner]["orphan_task"] is None
+    with pytest.raises(asyncio.CancelledError):
+        await orphan_task
+    assert process.terminated is False
+    assert manager.clients[late_child]["subscribed_to"] == session_id
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_last_subscriber_leaving_a_detached_session_arms_orphan_timer(
+    mocker,
+):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    assert manager.clients[owner]["orphan_task"] is None
+
+    await manager.unsubscribe(subscriber)
+
+    orphan_task = manager.clients[owner]["orphan_task"]
+    assert orphan_task is not None
+    sleep.release(connection_manager.ORPHAN_GRACE_SEC)
+    await orphan_task
+    assert process.terminated is True
+    assert owner not in manager.clients
+
+
+@pytest.mark.asyncio
+async def test_stop_by_session_id_requires_the_owners_did(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    stranger = _Sock()
+    _connected_client(manager, stranger)
+    manager.clients[stranger]["did"] = "someone-else"
+    same_did = _Sock()
+    _connected_client(manager, same_did)
+    manager.clients[same_did]["did"] = "owner-did"
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    send_message_event = mocker.patch.object(
+        manager, "send_message_event", new=AsyncMock()
+    )
+
+    await manager.stop_session(stranger, session_id)
+    assert send_message_event.await_args.args[2] == "SESSION_NOT_OWNED"
+    assert process.terminated is False
+
+    await manager.stop_session(same_did, "cap_nope")
+    assert send_message_event.await_args.args[2] == "SESSION_NOT_FOUND"
+
+    await manager.stop_session(same_did, session_id)
+    assert process.terminated is True
+    assert manager.sessions == {}
+    assert owner not in manager.clients
+    stopped = _events(send_event, "CAPTURE_STOPPED")
+    assert {call.args[0] for call in stopped} == {subscriber, same_did}
+    assert all(call.args[3]["reason"] == "OWNER_STOP" for call in stopped)
+    requester = next(call for call in stopped if call.args[0] is same_did)
+    assert requester.args[3]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_deadline_still_fires_on_a_detached_session(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, duration_sec=30, subscriber=subscriber
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    sleep.release(30)
+    await deadline_task
+
+    assert process.terminated is True
+    assert owner not in manager.clients
+    assert manager.sessions == {}
+    (stopped,) = _events(send_event, "CAPTURE_STOPPED")
+    assert stopped.args[0] is subscriber
+    assert stopped.args[3]["reason"] == "DURATION_ELAPSED"
+
+
+@pytest.mark.asyncio
+async def test_owner_send_failure_detaches_bounded_but_ends_perpetual(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+
+    bounded = _Sock()
+    bounded.send_bytes.side_effect = RuntimeError("gone")
+    _connected_client(manager, bounded)
+    _connected_client(manager, subscriber)
+    process, _, _ = await _running_capture(
+        manager, mocker, bounded, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    await manager.subscribe(subscriber, manager.clients[bounded]["session_id"])
+    await manager._broadcast_chunk(bounded, manager.clients[bounded], b"x")
+    assert manager.clients[bounded]["owner_attached"] is False
+    subscriber.send_bytes.assert_awaited_once_with(b"x")
+    assert process.terminated is False
+    await manager.stop_streaming(bounded, notify=False)
+
+    perpetual = _Sock()
+    perpetual.send_bytes.side_effect = RuntimeError("gone")
+    _connected_client(manager, perpetual)
+    await _running_capture(manager, mocker, perpetual, [{"freq": 2412, "width": 20}])
+    with pytest.raises(RuntimeError):
+        await manager._broadcast_chunk(perpetual, manager.clients[perpetual], b"x")
+    await manager.stop_streaming(perpetual, notify=False)

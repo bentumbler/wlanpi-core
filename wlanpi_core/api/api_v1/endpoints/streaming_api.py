@@ -108,13 +108,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     | `get_supported_frequencies` | `{}` | Returns supported channel list |
     | `configure` | `{ "interfaces": { "wlanpi0": {…} } }` | Per-interface capture config |
     | `start` | `{ "interfaces": ["wlanpi0"], "pcap_filter": "…", "duration_sec": 300 }` | Begin streaming (`duration_sec` optional) |
-    | `stop` | `{}` | Stop capture for this client |
+    | `stop` | `{}` or `{ "session_id": "cap_…" }` | Stop own capture, or a session owned by this principal |
 
     **Bounded captures:** `duration_sec` (1–3600) makes core stop the capture
     itself when the time is up; omit it for a perpetual capture that runs until
     `stop` or the socket closes. `CAPTURE_STOPPED` / `CAPTURE_ENDED` carry
     `data.reason` (`OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`,
-    `PROCESS_EXITED`) so clients can tell a timer from a user stop.
+    `PROCESS_EXITED`, `NO_LISTENERS`) so clients can tell a timer from a user
+    stop.
+
+    **Detached captures:** a bounded capture belongs to its `did`, not its
+    socket. If the owner's socket closes it keeps running for its subscribers
+    until its deadline, until `stop` with its `session_id` from any connection
+    authenticated as the same `did`, or until it has had no listeners for a
+    short grace period (`NO_LISTENERS`). A perpetual capture still stops the
+    moment its owner's socket closes.
 
     **Reconfiguring mid-stream:** `configure` may be sent while a capture is
     running. Interfaces belonging to the running capture are retuned in place -
@@ -201,7 +209,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
 
             elif command == "stop":
-                await manager.stop_streaming(websocket)
+                await manager.stop_session(websocket, data.get("session_id"))
 
             elif command == "subscribe":
                 await manager.subscribe(websocket, data.get("session_id"))

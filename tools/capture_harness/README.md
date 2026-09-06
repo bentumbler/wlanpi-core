@@ -93,7 +93,11 @@ convenience):
 The subscriber prints a `SUBSCRIBER` banner and the owner's running config
 (channels, width, dwell, filter) learned from the `SUBSCRIBED` event — it is
 never blind to what it receives — then the identical binary stream. It cannot
-control the capture and stops receiving when the owner stops or disconnects.
+control the capture and stops receiving when the capture ends. A perpetual
+capture ends when its owner disconnects; a bounded one (`--duration` on the
+owner) keeps streaming to subscribers after the owner has gone, until its
+deadline, a `stop` by session id from the same principal, or 15 s with no one
+attached.
 
 The owner prints an `OWNER` banner. If the interface you ask to capture is
 already owned by another session, the owner run warns you (with the
