@@ -784,6 +784,90 @@ def handle_files_apps_json_missing_orb(namespace_service, netcfg_env, scenario: 
     start_app.assert_called_once_with("orb_ns", "orb")
 
 
+# --- supplicant log store (docs/supplicant-log-plan.md, S1) ---
+
+_SUP_PATCH = "wlanpi_core.services.network_namespace_service.wpa_supplicant.start_or_restart_supplicant"
+
+
+def _sta_ns(namespace="ns_sta", **kwargs) -> dict:
+    base = dict(interface="wlan1", phy="phy1", iface_display_name="wlan1", security=_security("Lab-EHT"))
+    base.update(kwargs)
+    return _ns(namespace, **base).model_dump(mode="json")
+
+
+def handle_mlo_default_debug_level_dd(namespace_service, netcfg_env, scenario: Scenario):
+    _write_netconfig(netcfg_env, "mlo_cfg", namespaces=[_sta_ns(mlo=True)])
+    with hardware_success_mocks():
+        with patch(_SUP_PATCH) as sup:
+            result = nc.activate_config_with_result("mlo_cfg", override_active=True)
+    assert result.ok is True
+    sup.assert_called_once()
+    kwargs = sup.call_args.kwargs
+    store = namespace_service.supplicant_logs
+    assert kwargs["debug_level"] == 2
+    assert Path(kwargs["log_path"]).parent == store.log_dir
+    assert len(result.connections) == 1
+    conn = result.connections[0]
+    assert conn["iface"] == "wlan1" and conn["namespace"] == "ns_sta"
+    sidecar = store.read(conn["conn_id"])
+    assert sidecar["outcome"] == "in_progress"
+    assert sidecar["mlo"] is True and sidecar["debug_level"] == 2
+    assert sidecar["config_id"] == "mlo_cfg" and sidecar["ssid"] == "Lab-EHT"
+    assert Path(kwargs["log_path"]) == store.log_path(conn["conn_id"])
+
+
+def handle_debug_level_override_wins(namespace_service, netcfg_env, scenario: Scenario):
+    cfg_path = _write_netconfig(netcfg_env, "dbg_cfg", namespaces=[_sta_ns(mlo=True, debug_level=2)])
+    with hardware_success_mocks():
+        with patch(_SUP_PATCH) as sup:
+            result = nc.activate_config_with_result("dbg_cfg", override_active=True, debug_level=1)
+    assert result.ok is True
+    assert sup.call_args.kwargs["debug_level"] == 1
+    sidecar = namespace_service.supplicant_logs.read(result.connections[0]["conn_id"])
+    assert sidecar["debug_level"] == 1
+    stored = json.loads(Path(cfg_path).read_text())
+    assert stored["namespaces"][0]["debug_level"] == 2, "override must not rewrite the stored config"
+
+
+def handle_same_iface_two_namespaces_distinct_logs(namespace_service, netcfg_env, scenario: Scenario):
+    _write_netconfig(
+        netcfg_env,
+        "twin_cfg",
+        namespaces=[
+            _ns("ns_a", interface="wlan0", phy="phy0", security=_security("NetA")).model_dump(mode="json"),
+            _ns("ns_b", interface="wlan0", phy="phy1", security=_security("NetB")).model_dump(mode="json"),
+        ],
+    )
+    with hardware_success_mocks():
+        with patch(_SUP_PATCH) as sup:
+            result = nc.activate_config_with_result("twin_cfg", override_active=True)
+    assert result.ok is True
+    assert sup.call_count == 2
+    ids = [c["conn_id"] for c in result.connections]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    assert {c["namespace"] for c in result.connections} == {"ns_a", "ns_b"}
+    log_paths = {c.kwargs["log_path"] for c in sup.call_args_list}
+    assert len(log_paths) == 2 and all(Path(p).exists() for p in log_paths)
+    store = namespace_service.supplicant_logs
+    assert {e["conn_id"] for e in store.list()} == set(ids)
+
+
+def handle_supplicant_log_closed_on_deactivate(namespace_service, netcfg_env, scenario: Scenario):
+    _write_netconfig(netcfg_env, "mlo_cfg", namespaces=[_sta_ns(mlo=True)])
+    store = namespace_service.supplicant_logs
+    with hardware_success_mocks():
+        with patch(_SUP_PATCH):
+            result = nc.activate_config_with_result("mlo_cfg", override_active=True)
+        conn_id = result.connections[0]["conn_id"]
+        assert store.read(conn_id)["outcome"] == "in_progress"
+        assert nc.deactivate_config("mlo_cfg") is True
+    sidecar = store.read(conn_id)
+    assert sidecar["outcome"] == "deactivated"
+    assert sidecar["ended_at"] is not None
+    assert store.log_path(conn_id).exists(), "log must survive teardown"
+    assert netcfg_env["ccf"].read_text().strip() == "default"
+
+
 HANDLERS = {
     "default_hardcoded_no_file": handle_default_hardcoded_no_file,
     "default_file_override": handle_default_file_override,
@@ -826,6 +910,10 @@ HANDLERS = {
     "files_all_configs_deleted": handle_files_all_configs_deleted,
     "list_configs_malformed_annotation": handle_list_configs_malformed_annotation,
     "files_apps_json_missing_orb": handle_files_apps_json_missing_orb,
+    "mlo_default_debug_level_dd": handle_mlo_default_debug_level_dd,
+    "debug_level_override_wins": handle_debug_level_override_wins,
+    "same_iface_two_namespaces_distinct_logs": handle_same_iface_two_namespaces_distinct_logs,
+    "supplicant_log_closed_on_deactivate": handle_supplicant_log_closed_on_deactivate,
 }
 
 

@@ -158,6 +158,8 @@ class RootConfig(BaseModel):
     interface: str
     security: Optional[NetSecurity] = None
     mlo: bool = False
+    # wpa_supplicant verbosity: 0 default, 1 -d, 2 -dd. None = 2 when mlo else 0.
+    debug_level: Optional[int] = Field(default=None, ge=0, le=2)
     default_route: bool = False
     autostart_app: Optional[str] = None
 
@@ -269,6 +271,7 @@ class NetworkSetupStatus(BaseModel):
     response: NetworkSetupLog
     connectedNet: Optional[ScanItem]
     input: str
+    conn_id: Optional[str] = None  # supplicant log attempt id, e.g. conn_3f9a1c2e
 
 
 class ConnectedNetwork(BaseModel):

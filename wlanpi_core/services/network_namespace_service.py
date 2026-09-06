@@ -9,6 +9,7 @@ from wlanpi_core.constants import (
     DEFAULT_DHCP_DIR,
     PID_DIR,
     IW_FILE,
+    SUPPLICANT_LOG_DIR,
 )
 from wlanpi_core.models.runcommand_error import RunCommandError
 from wlanpi_core.schemas.network.network import (
@@ -40,6 +41,7 @@ from wlanpi_core.connection.monitor import ConnectionMonitor, stop_all_connectio
 from wlanpi_core.wpa import (
     config as wpa_config,
     supplicant as wpa_supplicant,
+    supplicant_log,
     status as wpa_status,
 )
 
@@ -50,11 +52,13 @@ class NetworkNamespaceService:
         config_dir=DEFAULT_CONFIG_DIR,
         ctrl_interface=DEFAULT_CTRL_INTERFACE,
         dhcp_dir=DEFAULT_DHCP_DIR,
+        supplicant_log_dir=SUPPLICANT_LOG_DIR,
     ):
         self.config_dir = Path(config_dir)
         self.ctrl_interface = ctrl_interface
         self.dhcp_dir = Path(dhcp_dir)
         self.pid_dir = Path(PID_DIR)
+        self.supplicant_logs = supplicant_log.SupplicantLogStore(supplicant_log_dir)
         # PID dir is created lazily when first needed (e.g. in apps.start_app_in_namespace)
         # so that importing this service does not touch the filesystem (CI has no /home/wlanpi).
 
@@ -161,14 +165,15 @@ class NetworkNamespaceService:
         self.log.info("Updating global settings: %s", settings)
         self.global_settings.update(settings)
 
-    def parse_wpa_log(self, iface: str, timeout: int = 30):
-        """
-        Parse wpa_supplicant log file.
-        
-        Delegates to wpa.supplicant module.
-        Note: Event logging is not preserved in the extracted function.
-        """
-        wpa_supplicant.parse_wpa_log(iface, timeout=timeout)
+    @staticmethod
+    def effective_debug_level(cfg: Union[NamespaceConfig, RootConfig], override: Optional[int] = None) -> int:
+        """Supplicant verbosity for an activation: override > stored field > MLO default (-dd)."""
+        if override is not None:
+            return int(override)
+        stored = getattr(cfg, "debug_level", None)
+        if stored is not None:
+            return int(stored)
+        return 2 if getattr(cfg, "mlo", False) else 0
 
     def get_interfaces(self):
         """Get list of wireless interfaces using the adapter discovery module."""
@@ -179,15 +184,19 @@ class NetworkNamespaceService:
         cfg: Union[NamespaceConfig, RootConfig],
         iface: str,
         namespace: Optional[str],
-        timeout: int = 15
+        timeout: int = 15,
+        conn_id: Optional[str] = None,
     ):
         """
         Start background connection monitor using the connection.monitor module.
         
         This method delegates to ConnectionMonitor.start_monitor() which handles
-        the background monitoring, DHCP, routes, and app startup.
+        the background monitoring, DHCP, routes, and app startup, and records the
+        outcome against conn_id in the supplicant log store.
         """
-        ConnectionMonitor.start_monitor(cfg, iface, namespace, timeout=timeout)
+        ConnectionMonitor.start_monitor(
+            cfg, iface, namespace, timeout=timeout, conn_id=conn_id, log_store=self.supplicant_logs
+        )
 
     def stop_connection_monitor(self, namespace: Optional[str], iface: str):
         """
@@ -205,10 +214,18 @@ class NetworkNamespaceService:
         """
         stop_all_connection_monitors()
 
-    def activate_config(self, cfg: Union[NamespaceConfig, RootConfig]) -> NetworkSetupStatus:
+    def activate_config(
+        self,
+        cfg: Union[NamespaceConfig, RootConfig],
+        config_id: Optional[str] = None,
+        debug_level: Optional[int] = None,
+    ) -> NetworkSetupStatus:
         """
         Activate a network configuration. Returns NetworkSetupStatus.
         Performs comprehensive validation before any state changes.
+
+        config_id and debug_level only annotate/tune the supplicant log for this
+        attempt; debug_level overrides the stored field for this activation only.
         """
         # Validate config before any state changes
         is_valid, error_msg = self._validate_config(cfg)
@@ -266,6 +283,7 @@ class NetworkNamespaceService:
         # Use display name if available, otherwise fall back to interface
         iface = cfg.iface_display_name or iface
         connected_state = False
+        conn_id: Optional[str] = None
 
         if cfg.security:
             # Additional validation: ensure ssid exists (should be caught by validation, but double-check)
@@ -282,8 +300,25 @@ class NetworkNamespaceService:
             
             wpa_config.write_wpa_config(cfg, self.config_dir, self.global_settings)
             write_dhcp_config(iface, self.dhcp_dir)
+            level = self.effective_debug_level(cfg, debug_level)
+            conn_id = supplicant_log.new_conn_id()
+            log_path = self.supplicant_logs.create(
+                conn_id,
+                iface=iface,
+                namespace=namespace,
+                phy=cfg.phy,
+                ssid=cfg.security.ssid,
+                mlo=bool(cfg.mlo),
+                debug_level=level,
+                config_id=config_id,
+            )
             wpa_supplicant.start_or_restart_supplicant(
-                iface, namespace, self.config_dir / f"{iface}.conf", self.ctrl_interface
+                iface,
+                namespace,
+                self.config_dir / f"{iface}.conf",
+                self.ctrl_interface,
+                debug_level=level,
+                log_path=log_path,
             )
             
             # Start background connection monitor instead of blocking
@@ -293,7 +328,7 @@ class NetworkNamespaceService:
                 f"Started wpa_supplicant for {iface} in {namespace_display}. "
                 f"Connection will be monitored in background. Returning with 'provisioned' status."
             )
-            self._monitor_connection_async(cfg, iface, namespace, timeout=15)
+            self._monitor_connection_async(cfg, iface, namespace, timeout=15, conn_id=conn_id)
             
             # Return immediately with "provisioned" status - connection is in progress
             connected_state = False  # Will be updated by background monitor
@@ -363,6 +398,7 @@ class NetworkNamespaceService:
             response=log,
             connectedNet=connected,
             input=cfg.__str__(),
+            conn_id=conn_id,
         )
         
     def deactivate_config(self, cfg: Union[NamespaceConfig, RootConfig]):
@@ -371,6 +407,11 @@ class NetworkNamespaceService:
         
         # Stop any active connection monitor for this config
         self.stop_connection_monitor(namespace, iface)
+        # Close the supplicant log sidecar(s) for this iface; the log itself is kept
+        try:
+            self.supplicant_logs.close_open(iface, namespace)
+        except Exception as e:
+            self.log.warning(f"Could not close supplicant log for {iface}: {e} (non-critical)")
         
         # Check if interface actually exists before trying to deactivate
         interfaces = self.get_interfaces()

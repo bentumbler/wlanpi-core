@@ -90,11 +90,14 @@ def mock_namespace_execution():
             return_value=_DEFAULT_WPA_STATUS.copy(),
         ),
     ]
-    started = [p.start() for p in patches]
+    # Stop the patchers, not the mocks start() returned: MagicMock.stop() is a
+    # silent no-op, which leaked every patch here for the rest of the session.
+    for p in patches:
+        p.start()
     try:
         yield
     finally:
-        for p in reversed(started):
+        for p in reversed(patches):
             p.stop()
 
 
@@ -129,6 +132,7 @@ def netcfg_env(tmp_path, monkeypatch):
     service = NetworkNamespaceService(
         config_dir=tmp_path / "wpa",
         dhcp_dir=tmp_path / "dhcp",
+        supplicant_log_dir=tmp_path / "supplicant-logs",
     )
     service.config_dir.mkdir(parents=True, exist_ok=True)
     service.dhcp_dir.mkdir(parents=True, exist_ok=True)
@@ -225,11 +229,14 @@ def hardware_success_mocks(interfaces=None, phy_move_side_effect=None):
         ),
     ]
 
-    started = [p.start() for p in patches]
+    # Stop the patchers, not the mocks start() returned: MagicMock.stop() is a
+    # silent no-op, which leaked every patch here for the rest of the session.
+    for p in patches:
+        p.start()
     try:
         yield
     finally:
-        for p in reversed(started):
+        for p in reversed(patches):
             p.stop()
 
 

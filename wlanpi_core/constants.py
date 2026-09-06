@@ -63,7 +63,8 @@ CONFIG_DIR = str(HOME_DIR / ".local/share/wlanpi-core/netcfg/configs")
 CURRENT_CONFIG_FILE = str(HOME_DIR / ".local/share/wlanpi-core/netcfg/current.txt")
 PID_DIR = str(HOME_DIR / ".local/share/wlanpi-core/netcfg/pids")
 APPS_FILE = str(HOME_DIR / ".local/share/wlanpi-core/netcfg/apps.json")
-WPA_LOG_FILE = "/tmp/wpa.log"
+SUPPLICANT_LOG_DIR = str(HOME_DIR / ".local/share/wlanpi-core/netcfg/supplicant-logs")
+SUPPLICANT_LOG_RETAIN = 10
 CREATE_MONITOR_PAIRS_DEFAULT = True
 CREATE_MONITOR_PAIRS_UNINIT = True
 

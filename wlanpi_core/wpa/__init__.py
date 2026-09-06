@@ -12,7 +12,6 @@ from wlanpi_core.wpa.config import (
 )
 from wlanpi_core.wpa.supplicant import (
     kill_all_supplicants,
-    parse_wpa_log,
     start_or_restart_supplicant,
 )
 from wlanpi_core.wpa.scan import (
@@ -33,7 +32,6 @@ __all__ = [
     "generate_global_header",
     # Supplicant management
     "start_or_restart_supplicant",
-    "parse_wpa_log",
     "kill_all_supplicants",
     # Status
     "get_wpa_status",

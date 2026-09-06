@@ -14,6 +14,7 @@ from wlanpi_core.utils.network_management import (
     restart_dhcp_with_timeout,
     set_default_route,
 )
+from wlanpi_core.wpa import supplicant_log
 from wlanpi_core.wpa.status import get_wpa_status
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class ConnectionMonitor:
         iface: str,
         namespace: Optional[str],
         timeout: int = 15,
+        conn_id: Optional[str] = None,
+        log_store: Optional[supplicant_log.SupplicantLogStore] = None,
     ) -> None:
         """
         Start a background connection monitor for an interface.
@@ -47,6 +50,8 @@ class ConnectionMonitor:
             iface: Interface name
             namespace: Network namespace name, or None for root
             timeout: Monitor timeout in seconds
+            conn_id: Supplicant log attempt to record the outcome against
+            log_store: Store holding conn_id (defaults to the module store)
 
         Examples:
             >>> ConnectionMonitor.start_monitor(config, "wlan0", "test_ns", timeout=15)
@@ -65,6 +70,15 @@ class ConnectionMonitor:
                     _connection_monitors.pop(monitor_key, None)
                     _monitor_stop_flags.pop(monitor_key, None)
 
+        def _record(outcome: str, wpa: Optional[dict] = None) -> None:
+            if not conn_id:
+                return
+            store = log_store or supplicant_log.default_store
+            try:
+                store.record_outcome(conn_id, outcome, wpa)
+            except Exception as e:
+                log.warning(f"[ConnectionMonitor] Could not record outcome for {conn_id}: {e}")
+
         def _monitor_body():
             log.info(
                 f"[ConnectionMonitor] Starting connection monitor for {iface} in {namespace_display} "
@@ -74,6 +88,7 @@ class ConnectionMonitor:
             poll_interval = 1
             connected_state = False
             poll_count = 0
+            wpa: dict = {}
 
             stop_event = _monitor_stop_flags.get(monitor_key)
             if not stop_event:
@@ -92,11 +107,12 @@ class ConnectionMonitor:
                         f"[ConnectionMonitor] Connection monitor for {iface} in {namespace_display} "
                         f"stopped by stop event"
                     )
+                    _record("stopped", wpa)
                     return
 
                 try:
                     status = get_wpa_status(iface, namespace)
-                    wpa: dict = status.get("wpa_status", {})
+                    wpa = status.get("wpa_status", {})
                     wpa_state = (wpa.get("wpa_state") or "").upper()
                     poll_count += 1
 
@@ -126,6 +142,7 @@ class ConnectionMonitor:
                     time.sleep(poll_interval)
 
             if connected_state:
+                _record("connected", wpa)
                 # Start DHCP after connection
                 try:
                     log.info(f"[ConnectionMonitor] Starting DHCP for {iface} in {namespace_display} after connection")
@@ -159,6 +176,7 @@ class ConnectionMonitor:
                     f"in {namespace_display} (elapsed={elapsed}s, checks={poll_count}). "
                     f"Configuration remains active for future connection."
                 )
+                _record("stopped" if stop_event.is_set() else "timeout", wpa)
 
         # Create and start monitor thread
         log.info(

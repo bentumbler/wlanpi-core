@@ -1,7 +1,7 @@
 import asyncio
-from typing import Optional, Union
+from typing import Annotated, Any, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from wlanpi_core.core.auth import verify_auth_wrapper
 from wlanpi_core.models.network_config_errors import ConfigActiveError, ConfigMalformedError
@@ -192,25 +192,48 @@ async def delete_config(id: str, force: Optional[bool] = False):
 
 @router.post(
     "/activate/{id}",
-    response_model=dict[str, str],
+    response_model=dict[str, Any],
     response_model_exclude_none=True,
     dependencies=[Depends(verify_auth_wrapper)],
 )
-async def activate_config(id: str, override_active: Optional[bool] = False):
+async def activate_config(
+    id: str,
+    override_active: Optional[bool] = False,
+    debug_level: Annotated[
+        Optional[int],
+        Query(
+            ge=0,
+            le=2,
+            description=(
+                "One-shot wpa_supplicant verbosity for this activation: 0 default, "
+                "1 `-d`, 2 `-dd`. Overrides each adapter's stored `debug_level`; "
+                "the stored config is not modified."
+            ),
+        ),
+    ] = None,
+):
     """
     Activate a network configuration by ID.
+
+    `connections` lists one entry per wpa_supplicant started, each with the
+    `conn_id` under which that attempt's supplicant log is kept, plus the
+    interface and namespace (`null` for root).
     """
     try:
-        success = await asyncio.to_thread(
-            network_config.activate_config, id, override_active
+        result = await asyncio.to_thread(
+            network_config.activate_config_with_result, id, override_active, debug_level
         )
-        if not success:
+        if not result.ok:
             log.error(f"Failed to activate configuration: {id}")
             raise HTTPException(
                 status_code=500, detail="Failed to activate configuration"
             )
         log.info(f"Configuration activated: {id}")
-        return {"id": id, "message": "Configuration activated successfully"}
+        return {
+            "id": id,
+            "message": "Configuration activated successfully",
+            "connections": result.connections,
+        }
     except ConfigActiveError as cae:
         log.error(f"Configuration already active: {cae}")
         raise HTTPException(status_code=409, detail=str(cae))

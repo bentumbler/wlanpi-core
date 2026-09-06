@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from wlanpi_core.constants import CONFIG_DIR, CURRENT_CONFIG_FILE
 from wlanpi_core.models.network_config_errors import ConfigActiveError, ConfigMalformedError
@@ -337,7 +339,25 @@ def delete_config(cfg_id: str, force: bool = False) -> bool:
     return True
 
 
+@dataclass
+class ActivationResult:
+    """Outcome of activate_config_with_result: ok plus the supplicant log ids minted."""
+
+    ok: bool
+    connections: list[dict] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 def activate_config(cfg_id: str, override_active: bool = False) -> bool:
+    """Activate a configuration by cfg_id; see activate_config_with_result."""
+    return activate_config_with_result(cfg_id, override_active).ok
+
+
+def activate_config_with_result(
+    cfg_id: str, override_active: bool = False, debug_level: Optional[int] = None
+) -> ActivationResult:
     """Activate a configuration by cfg_id.
 
     Multi-adapter activation has three distinct outcomes (see tests/scenarios/ACTIVATION_OUTCOMES.md):
@@ -353,6 +373,10 @@ def activate_config(cfg_id: str, override_active: bool = False) -> bool:
        status=error). Deactivates activated_configs, re-raises; ccf unchanged.
 
     Provisioned-but-not-yet-connected is success path (1), not rollback.
+
+    debug_level overrides each adapter's stored supplicant verbosity for this
+    activation only. The result lists one {conn_id, iface, namespace} per
+    supplicant started, for retrieving its log later.
     """
 
     cfg = get_config(cfg_id)
@@ -380,24 +404,38 @@ def activate_config(cfg_id: str, override_active: bool = False) -> bool:
             log.info("Override active set: killing all wpa_supplicant processes before activation")
             ns.kill_all_supplicants()
         outcomes: list[str] = []
+        connections: list[dict] = []
         activated_configs.clear()
+
+        def _note(result, entry_cfg):
+            conn_id = getattr(result, "conn_id", None)
+            if conn_id:
+                connections.append(
+                    {
+                        "conn_id": conn_id,
+                        "iface": entry_cfg.iface_display_name or entry_cfg.interface,
+                        "namespace": getattr(entry_cfg, "namespace", None),
+                    }
+                )
 
         for ns_cfg in cfg.namespaces or []:
             log.info(
                 f"Activating namespace {ns_cfg.namespace} for interface {ns_cfg.interface}"
             )
-            result = ns.activate_config(ns_cfg)
+            result = ns.activate_config(ns_cfg, config_id=cfg_id, debug_level=debug_level)
             status = getattr(result, "status", "error") if result is not None else "error"
             outcomes.append(status)
+            _note(result, ns_cfg)
             # Only track as activated if it succeeded (not error, not skipped)
             if status in {"connected", "provisioned"}:
                 activated_configs.append(ns_cfg)
 
         for root_cfg in cfg.roots or []:
             log.info(f"Activating root config for interface {root_cfg.interface}")
-            result = ns.activate_config(root_cfg)
+            result = ns.activate_config(root_cfg, config_id=cfg_id, debug_level=debug_level)
             status = getattr(result, "status", "error") if result is not None else "error"
             outcomes.append(status)
+            _note(result, root_cfg)
             if status in {"connected", "provisioned"}:
                 activated_configs.append(root_cfg)
 
@@ -409,12 +447,12 @@ def activate_config(cfg_id: str, override_active: bool = False) -> bool:
         if all_ok:
             # Path 1: persist active config (monitors may still be connecting WPA)
             ccf.write_text(cfg_id)
-            return True
+            return ActivationResult(True, connections)
         else:
             # Path 2: UNACCEPTABLE status=error — roll back adapters that were applied
             log.error(f"Activation outcomes unacceptable {outcomes}. Rolling back only successfully activated configs")
             _rollback_activated_configs(activated_configs)
-            return False
+            return ActivationResult(False, connections)
 
     except Exception as ex:
         # Path 3: hard failure mid-loop — same rollback as path 2, then propagate

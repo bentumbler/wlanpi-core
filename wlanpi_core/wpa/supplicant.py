@@ -5,12 +5,12 @@ This module provides functions for starting, stopping, and managing
 wpa_supplicant processes.
 """
 import logging
-import time
 from pathlib import Path
 from typing import Optional
 
 from wlanpi_core.models.runcommand_error import RunCommandError
 from wlanpi_core.utils.namespace_execution import ns_exec
+from wlanpi_core.wpa.supplicant_log import debug_flags
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +20,8 @@ def start_or_restart_supplicant(
     namespace: Optional[str],
     config_path: Path,
     ctrl_interface: str = "/run/wpa_supplicant",
+    debug_level: int = 0,
+    log_path: Optional[Path] = None,
 ) -> None:
     """
     Start or restart wpa_supplicant for an interface.
@@ -29,6 +31,9 @@ def start_or_restart_supplicant(
         namespace: Network namespace name, or None for root
         config_path: Path to wpa_supplicant configuration file
         ctrl_interface: Control interface directory
+        debug_level: 0 = default verbosity, 1 = ``-d``, 2 = ``-dd``.
+            ``-K`` (key material in the log) is never passed.
+        log_path: File for ``-f``; defaults to the legacy ``/tmp/wpa-<iface>.log``
 
     Raises:
         RunCommandError: If wpa_supplicant fails to start
@@ -51,11 +56,11 @@ def start_or_restart_supplicant(
     except RunCommandError:
         pass  # May not exist, that's okay
 
-    # Prepare log file
-    log_file = Path(f"/tmp/wpa-{iface}.log")
-    if log_file.exists():
-        log_file.unlink()
-    log_file.touch()
+    # Prepare (truncate) the log file as the API user so it stays readable
+    # after the root-owned supplicant appends to it.
+    log_file = Path(log_path) if log_path else Path(f"/tmp/wpa-{iface}.log")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("")
 
     # Start wpa_supplicant
     ns_exec(
@@ -69,60 +74,17 @@ def start_or_restart_supplicant(
             "-D",
             "nl80211",
             "-f",
-            f"/tmp/wpa-{iface}.log",
+            str(log_file),
             "-t",
+            *debug_flags(debug_level),
         ],
         namespace=namespace,
     )
 
-    log.info(f"wpa_supplicant started for {iface} in namespace {namespace_display}")
-
-
-def parse_wpa_log(iface: str, timeout: int = 30) -> None:
-    """
-    Parse wpa_supplicant log file waiting for connection completion.
-
-    Args:
-        iface: Interface name
-        timeout: Maximum time to wait in seconds
-
-    Raises:
-        TimeoutError: If connection doesn't complete within timeout
-
-    Examples:
-        >>> parse_wpa_log("wlan0", timeout=30)
-    """
-    start_time = time.time()
-    log_file = Path(f"/tmp/wpa-{iface}.log")
-
-    if not log_file.exists():
-        log.warning(f"WPA log file {log_file} does not exist")
-        return
-
-    with log_file.open("r") as f:
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.1)
-                if time.time() - start_time > timeout:
-                    raise TimeoutError("Timeout waiting for connection to complete")
-                continue
-
-            line = line.strip()
-
-            # Extract timestamp if present
-            parts = line.split(":", 1)
-            if len(parts) == 2 and parts[0].replace(".", "", 1).isdigit():
-                epoch = float(parts[0])
-                log_msg = parts[1].strip()
-            else:
-                log_msg = line
-
-            log.debug(f"WPA log: {log_msg}")
-
-            if "CTRL-EVENT-CONNECTED" in line and "completed" in line:
-                log.info(f"Connection completed for {iface}")
-                break
+    log.info(
+        f"wpa_supplicant started for {iface} in namespace {namespace_display} "
+        f"(debug_level={debug_level}, log={log_file})"
+    )
 
 
 def kill_all_supplicants() -> None:
