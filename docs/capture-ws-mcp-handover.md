@@ -40,7 +40,7 @@ timeout / a token in the URL). After that:
 |---|---|---|
 | `get_supported_frequencies` | `{}` | channel list the device supports |
 | `configure` | `{"interfaces": {"wlanpi0": {"channels": [{"freq": 2412, "width": 20}], "dwell_time": 250}}}` | per-interface config; `width` ∈ {20,40,80,160}, `dwell_time` 50–60000 ms |
-| `start` | `{"interfaces": ["wlanpi0"], "pcap_filter": ""}` | begins capture; interfaces must be configured first |
+| `start` | `{"interfaces": ["wlanpi0"], "pcap_filter": "", "duration_sec": 300}` | begins capture; interfaces must be configured first. `duration_sec` (1–3600) is optional: core stops the capture itself when it elapses; omit for a perpetual capture |
 | `stop` | `{}` | owner only |
 | `subscribe` | `{"session_id": "cap_xxxx"}` | listen read-only to another socket's capture |
 | `unsubscribe` | `{}` | detach |
@@ -56,7 +56,8 @@ Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
   `AUTH_OK` (`data.did`), `CAPTURE_STARTED` (`data.session_id`,
   `data.interfaces`), `CHANNEL_SET` / `CHANNEL_SET_FAILED` (hop status; failure
   `data.message` carries the `iw` reason), `SUBSCRIBED`, `SESSIONS`
-  (`data.sessions`), `CAPTURE_STOPPED` / `CAPTURE_ENDED`, and `error` events
+  (`data.sessions`), `CAPTURE_STOPPED` / `CAPTURE_ENDED` (`data.reason` ∈
+  `OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`, `PROCESS_EXITED`), and `error` events
   (`AUTH_FAILED`, `INTERFACE_IN_USE`, `SESSION_NOT_FOUND`, `CONFIG_INVALID`, …).
 
 ---
@@ -207,8 +208,10 @@ tools use the same user JWT flow as the rest of MCP.
 3. `configure` then `start`; capture the `session_id` from `CAPTURE_STARTED`.
 4. Incremental pcapng reader (chunks are unaligned; a new SHB can appear
    mid-stream — reset interface state on it). See `PcapngReader` in the harness.
-5. Bounded read: stop after `duration_s` or a frame budget; always `stop` and
-   close in a `finally`.
+5. Bounded read: pass the tool's `duration_s` as `duration_sec` on `start` so
+   core ends the capture (and subscribers learn the plan); stop earlier on a
+   frame budget if you have one. Still `stop` and close in a `finally` — it is
+   idempotent.
 6. Dissect to a compact summary. Reuse the harness's radiotap + IE parsing
    scope (SSID, channel, signal, security, HT/VHT/HE/EHT, tx power) or extend
    it; do not ship raw pcap to the model.

@@ -19,6 +19,9 @@ _MAX_CAPTURE_CHANNELS = 128
 _MIN_DWELL_TIME_MS = 50
 _MAX_DWELL_TIME_MS = 60_000
 _MAX_PCAP_FILTER_BYTES = 1024
+#: Longest bounded capture. Omitting duration_sec keeps a capture perpetual;
+#: the cap bounds the radio hold when the owner never comes back for it.
+MAX_CAPTURE_DURATION_SEC = 3600
 
 
 def validate_capture_interface(value: str) -> str:
@@ -47,6 +50,18 @@ def validate_pcap_filter(value: Optional[str]) -> str:
         raise ValueError("pcap_filter is too long")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("pcap_filter must not contain control characters")
+    return value
+
+
+def validate_capture_duration(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("duration_sec must be an integer number of seconds")
+    if value < 1 or value > MAX_CAPTURE_DURATION_SEC:
+        raise ValueError(
+            f"duration_sec must be between 1 and {MAX_CAPTURE_DURATION_SEC}"
+        )
     return value
 
 
@@ -102,6 +117,9 @@ class CaptureStart(BaseModel):
         max_length=_MAX_CAPTURE_INTERFACES,
     )
     pcap_filter: str = ""
+    #: Seconds after which core stops the capture itself. None = perpetual
+    #: (runs until the owner stops it or its socket closes), as before.
+    duration_sec: Optional[int] = None
 
     model_config = {"extra": "forbid"}
 
@@ -117,3 +135,8 @@ class CaptureStart(BaseModel):
     @classmethod
     def validate_filter_field(cls, value: Optional[str]) -> str:
         return validate_pcap_filter(value)
+
+    @field_validator("duration_sec", mode="before")
+    @classmethod
+    def validate_duration_field(cls, value: Optional[int]) -> Optional[int]:
+        return validate_capture_duration(value)

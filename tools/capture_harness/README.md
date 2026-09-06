@@ -65,7 +65,10 @@ export WLANPI_CAP_TOKEN='eyJ...'
 
 Authenticates, configures, starts the capture, prints the **session id**, then
 shows a rolling AP scan every few seconds. `--raw-out` also saves the raw
-pcapng for opening in Wireshark. Ctrl-C stops cleanly.
+pcapng for opening in Wireshark. Ctrl-C stops cleanly. `--duration` is sent to
+core as `duration_sec`, so core ends the capture itself when the time is up and
+every subscriber sees `CAPTURE_STOPPED` with reason `DURATION_ELAPSED`; without
+it the capture is perpetual and runs until Ctrl-C.
 
 ### 3. Subscribe (read-only, second instance)
 

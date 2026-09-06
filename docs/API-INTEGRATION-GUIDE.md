@@ -407,6 +407,14 @@ Then binary pcapng frames stream until `{ "command": "stop" }`, the socket
 closes, or the capture ends (`CAPTURE_ENDED`). Only the owning connection can
 `configure`/`stop`.
 
+**Bounded capture.** Add `"duration_sec": 300` (1–3600) to `start` and core
+stops the capture itself when the time is up — no client-side sleep-then-stop,
+and every subscriber can see the plan in `duration_sec`/`remaining_sec`. Omit
+it and the capture is perpetual, exactly as before. Every end says why:
+`CAPTURE_STOPPED` carries `data.reason` = `OWNER_STOP`, `OWNER_DISCONNECT` or
+`DURATION_ELAPSED`; `CAPTURE_ENDED` (dumpcap exited) carries `PROCESS_EXITED`.
+The duration cannot be changed on a running capture.
+
 ### 11.3 Retune mid-capture
 
 Send `configure` again while the capture runs to change the channel list or
@@ -478,9 +486,11 @@ Notable codes: `AUTH_OK`, `AUTH_FAILED`, `CAPTURE_STARTED`, `CHANNEL_SET` /
 `CHANNEL_SET_FAILED` (hop status; the failure message carries the `iw` reason —
 on single-radio devices the phy can be briefly busy while the managed interface
 scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
-(sent to subscribers after a live retune), `CAPTURE_STOPPED`,
-`CAPTURE_ENDED`, and errors `INTERFACE_IN_USE`, `INTERFACE_NOT_AVAILABLE`,
-`SESSION_NOT_FOUND`, `CONFIG_INVALID`, `UNKNOWN_COMMAND`.
+(sent to subscribers after a live retune), `CAPTURE_STOPPED` /
+`CAPTURE_ENDED` (with `data.reason`, see 11.2), and errors `INTERFACE_IN_USE`,
+`INTERFACE_NOT_AVAILABLE`, `SESSION_NOT_FOUND`, `CONFIG_INVALID`,
+`CAPTURE_CONFIG_INVALID` (bad `start`, e.g. `duration_sec` out of range),
+`UNKNOWN_COMMAND`.
 
 **Reference client:** `tools/capture_harness/` implements this whole flow
 (owner, subscriber-by-interface, and pcapng dissection). **MCP integration:**

@@ -107,8 +107,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     |---------|---------|--------|
     | `get_supported_frequencies` | `{}` | Returns supported channel list |
     | `configure` | `{ "interfaces": { "wlanpi0": {…} } }` | Per-interface capture config |
-    | `start` | `{ "interfaces": ["wlanpi0"], "pcap_filter": "…" }` | Begin streaming |
+    | `start` | `{ "interfaces": ["wlanpi0"], "pcap_filter": "…", "duration_sec": 300 }` | Begin streaming (`duration_sec` optional) |
     | `stop` | `{}` | Stop capture for this client |
+
+    **Bounded captures:** `duration_sec` (1–3600) makes core stop the capture
+    itself when the time is up; omit it for a perpetual capture that runs until
+    `stop` or the socket closes. `CAPTURE_STOPPED` / `CAPTURE_ENDED` carry
+    `data.reason` (`OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`,
+    `PROCESS_EXITED`) so clients can tell a timer from a user stop.
 
     **Reconfiguring mid-stream:** `configure` may be sent while a capture is
     running. Interfaces belonging to the running capture are retuned in place -
@@ -190,7 +196,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             elif command == "start":
                 interfaces = data.get("interfaces", [])
                 pcap_filter = data.get("pcap_filter")
-                await manager.start_streaming(websocket, interfaces, pcap_filter)
+                await manager.start_streaming(
+                    websocket, interfaces, pcap_filter, data.get("duration_sec")
+                )
 
             elif command == "stop":
                 await manager.stop_streaming(websocket)
