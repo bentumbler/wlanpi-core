@@ -65,7 +65,10 @@ export WLANPI_CAP_TOKEN='eyJ...'
 
 Authenticates, configures, starts the capture, prints the **session id**, then
 shows a rolling AP scan every few seconds. `--raw-out` also saves the raw
-pcapng for opening in Wireshark. Ctrl-C stops cleanly.
+pcapng for opening in Wireshark. Ctrl-C stops cleanly. `--duration` is sent to
+core as `duration_sec`, so core ends the capture itself when the time is up and
+every subscriber sees `CAPTURE_STOPPED` with reason `DURATION_ELAPSED`; without
+it the capture is perpetual and runs until Ctrl-C.
 
 ### 3. Subscribe (read-only, second instance)
 
@@ -90,7 +93,11 @@ convenience):
 The subscriber prints a `SUBSCRIBER` banner and the owner's running config
 (channels, width, dwell, filter) learned from the `SUBSCRIBED` event — it is
 never blind to what it receives — then the identical binary stream. It cannot
-control the capture and stops receiving when the owner stops or disconnects.
+control the capture and stops receiving when the capture ends. A perpetual
+capture ends when its owner disconnects; a bounded one (`--duration` on the
+owner) keeps streaming to subscribers after the owner has gone, until its
+deadline, a `stop` by session id from the same principal, or 15 s with no one
+attached.
 
 The owner prints an `OWNER` banner. If the interface you ask to capture is
 already owned by another session, the owner run warns you (with the

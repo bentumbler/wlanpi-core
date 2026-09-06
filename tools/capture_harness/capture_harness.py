@@ -407,12 +407,13 @@ async def _authenticate(ws, token: str) -> str:
 
 
 async def _consume(ws, table: ScanTable, refresh: float, deadline: Optional[float],
-                   raw_fp) -> None:
+                   raw_fp) -> bool:
+    """Consume until the local deadline (False) or the capture ends (True)."""
     reader = PcapngReader()
     last_print = 0.0
     while True:
         if deadline and time.monotonic() >= deadline:
-            return
+            return False
         timeout = refresh
         if deadline:
             timeout = min(refresh, max(0.05, deadline - time.monotonic()))
@@ -436,12 +437,14 @@ async def _consume(ws, table: ScanTable, refresh: float, deadline: Optional[floa
             data = event.get("data", {})
             if code not in ("CHANNEL_SET",):  # keep hop spam down
                 note = data.get("message") or data
+                if isinstance(data, dict) and data.get("reason"):
+                    note = f"{note} [{data['reason']}]"
                 print(f"[event] {code}: {note}", file=sys.stderr)
             if code in ("CAPTURE_ENDED", "CAPTURE_STOPPED"):
-                # The capture is over (owner stopped, or dumpcap exited);
-                # stop consuming instead of idling on a dead session.
+                # The capture is over (owner stopped, timer elapsed, or
+                # dumpcap exited); stop consuming instead of idling on it.
                 print("[capture ended] stopping.", file=sys.stderr)
-                return
+                return True
         now = time.monotonic()
         if now - last_print >= refresh:
             print("\n" + table.render())
@@ -460,6 +463,19 @@ def _print_config(config: Optional[dict]) -> None:
         print(f"  {iface}: channels [{chans}] dwell {cfg.get('dwell_time')}ms")
     if config.get("pcap_filter"):
         print(f"  filter: {config['pcap_filter']}")
+
+
+def _print_lifetime(desc: Optional[dict]) -> None:
+    """elapsed / duration / remaining from a session descriptor (P6.2+)."""
+    if not desc or desc.get("elapsed_sec") is None:
+        return
+    line = f"  running for {desc['elapsed_sec']}s"
+    if desc.get("duration_sec") is not None:
+        line += (f", bounded to {desc['duration_sec']}s "
+                 f"({desc.get('remaining_sec')}s left)")
+    else:
+        line += ", perpetual (until the owner stops)"
+    print(line)
 
 
 async def _find_sessions(ws) -> list:
@@ -499,15 +515,18 @@ async def run_owner(args) -> None:
                 )
 
         await ws.send(json.dumps({"command": "configure", "interfaces": interfaces}))
-        await ws.send(
-            json.dumps(
-                {
-                    "command": "start",
-                    "interfaces": list(interfaces.keys()),
-                    "pcap_filter": pcap_filter,
-                }
-            )
-        )
+        start_cmd = {
+            "command": "start",
+            "interfaces": list(interfaces.keys()),
+            "pcap_filter": pcap_filter,
+        }
+        # An owner's --duration is core's job: send it as duration_sec and let
+        # core end the capture (subscribers see DURATION_ELAPSED). Keep a
+        # generous local deadline only as a guard against a wedged server.
+        duration_sec = int(round(args.duration)) if args.duration else None
+        if duration_sec:
+            start_cmd["duration_sec"] = max(1, duration_sec)
+        await ws.send(json.dumps(start_cmd))
         # Wait for CAPTURE_STARTED to surface the session id.
         session_id = None
         while session_id is None:
@@ -529,16 +548,18 @@ async def run_owner(args) -> None:
 
         raw_fp = open(args.raw_out, "wb") if args.raw_out else None
         table = ScanTable()
-        deadline = time.monotonic() + args.duration if args.duration else None
+        deadline = time.monotonic() + args.duration + 15 if args.duration else None
+        ended = False
         try:
-            await _consume(ws, table, args.refresh, deadline, raw_fp)
+            ended = await _consume(ws, table, args.refresh, deadline, raw_fp)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
-            try:
-                await ws.send(json.dumps({"command": "stop"}))
-            except Exception:
-                pass
+            if not ended:
+                try:
+                    await ws.send(json.dumps({"command": "stop"}))
+                except Exception:
+                    pass
             if raw_fp:
                 raw_fp.close()
                 print(f"\n[raw] wrote pcapng to {args.raw_out}", file=sys.stderr)
@@ -590,6 +611,7 @@ async def run_subscriber(args) -> None:
                 print(f"  session {session_id} owned by "
                       f"did={data.get('owner')} in namespace {ns}")
                 _print_config(data.get("config"))
+                _print_lifetime(data)
                 print("=" * 60)
                 break
             if event.get("event") == "error":
@@ -628,6 +650,7 @@ async def run_list(args) -> None:
                         f"interfaces={','.join(sess.get('interfaces', []))}"
                     )
                     _print_config(sess.get("config"))
+                    _print_lifetime(sess)
                 return
 
 
@@ -689,7 +712,12 @@ def main() -> None:
         p.add_argument("--token", help="wlanpi-core JWT")
         p.add_argument("--token-env", default="WLANPI_CAP_TOKEN")
         p.add_argument("--refresh", type=float, default=3.0, help="table interval s")
-        p.add_argument("--duration", type=float, help="stop after N seconds")
+        p.add_argument(
+            "--duration",
+            type=float,
+            help="owner: ask core to stop after N seconds (duration_sec); "
+            "subscriber: stop reading after N seconds",
+        )
         p.add_argument("--raw-out", help="write raw pcapng stream to this file")
 
     pr = sub.add_parser("run", help="start or subscribe to a capture")

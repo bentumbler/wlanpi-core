@@ -174,13 +174,14 @@ async def test_subscriber_receives_broadcast_and_stop_notification():
     owner.send_bytes.assert_awaited_once_with(b"pcapng-bytes")
     listener.send_bytes.assert_awaited_once_with(b"pcapng-bytes")
 
-    await mgr._end_session(client, "CAPTURE_STOPPED", "Capture stopped.")
+    await mgr._end_session(client, "CAPTURE_STOPPED", "Capture stopped.", "OWNER_STOP")
     assert mgr.sessions == {}
     assert client["subscribers"] == set()
     assert mgr.clients[listener]["subscribed_to"] is None
-    # The stop notification reached the listener.
-    sent = [c.args[0] for c in listener.send_text.await_args_list]
-    assert any("CAPTURE_STOPPED" in payload for payload in sent)
+    # The stop notification, with its reason, reached the listener.
+    sent = [json.loads(c.args[0]) for c in listener.send_text.await_args_list]
+    stopped = next(e for e in sent if e["code"] == "CAPTURE_STOPPED")
+    assert stopped["data"]["reason"] == "OWNER_STOP"
 
 
 @pytest.mark.asyncio
