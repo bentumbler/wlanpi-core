@@ -13,6 +13,7 @@ for external/remote MCP**. Capture-specific contract: [`capture-ws-mcp-handover.
 | `feature/tls-frontends` (#162, P3) | Feature-flagged nginx TLS front-ends (`:31416` API, `:8767` MCP, `:8443` dev); capture WS proxied over `wss://`; UFW; `nginx -t` tested |
 | `feature/capture-auth` (#165, P6) | Capture WS first-message auth (4401), `did`-owned sessions, read-only subscribers, namespace-aware capture, `ws://` nginx proxy; reference harness; handover doc |
 | wlanpi-mcp `feature/drop-client-tag` | MCP sends a plain Bearer (no sentinel) — depends on P1 |
+| `feature/capture-live-reconfig-p61` (fork PR #6, P6.1, on top of #165) | `configure` retunes a running capture in place; `CONFIG_APPLIED` reports `applied_live`/`deferred`; subscribers get `CONFIG_CHANGED` |
 
 **Merge order into `dev`, then rebuild the integration image once:** #159 → #160 → #162 → #165. They are largely independent; this order keeps auth (P1) and tokens (P2) landing before the branches that assume them.
 
@@ -31,6 +32,7 @@ On-box MCP (stdio, or loopback HTTP) reaches core over `localhost:31415`. That p
 | **P7** capture tools (owner: start/status/frames/stop; subscribe-by-interface via `list_sessions`) | wlanpi-mcp | Contract = `capture-ws-mcp-handover.md`; dissection reference = the harness |
 | **P5** token-from-env only; drop `X-Wlanpi-Client`; loopback/HTTPS docs | wlanpi-mcp | Depends on P1 being on the box |
 | **P4** `getjwt --export` / `--write-env` | wlanpi-core | So agents/instructors never paste a JWT into config |
+| **P6.2–P6.4** session lifetime: `elapsed_sec` on the descriptor; optional `duration_sec` on `start`; detached bounded captures | wlanpi-core | Stacked on P6.1; scoped in [`capture-ws-lifetime-plan.md`](./capture-ws-lifetime-plan.md) |
 
 When these land, internal MCP capture is production-usable for a single-operator box.
 
