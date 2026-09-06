@@ -1,11 +1,16 @@
 import asyncio
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 
 from wlanpi_core.models.command_result import CommandResult
 from wlanpi_core.streaming import connection_manager
 from wlanpi_core.streaming.connection_manager import ConnectionManager
+from wlanpi_core.streaming.models import (
+    MAX_CAPTURE_DURATION_SEC,
+    CaptureConfigurations,
+    CaptureStart,
+)
 
 
 class BlockingStdout:
@@ -43,37 +48,74 @@ def _connected_client(manager, websocket):
         "task": None,
         "channel_tasks": {},
         "interfaces": set(),
+        "did": None,
+        "session_id": None,
+        "subscribers": set(),
+        "subscribed_to": None,
+        "namespace": None,
+        "session_config": None,
+        "started_mono": None,
+        "duration_sec": None,
+        "deadline_task": None,
+        "stop_reason": None,
     }
+
+
+def _configs(**by_interface):
+    """Build exactly what the endpoint hands apply_configuration()."""
+    return CaptureConfigurations.model_validate(by_interface).root
+
+
+async def _drain_channel_task(manager, websocket, iface):
+    """Await an interface's hop task so its retune has definitely happened.
+
+    Single-channel plans apply once and return, so this terminates. Awaiting
+    the task is the synchronization point; never poll the mock (AGENTS #1).
+    """
+    task = manager.clients[websocket]["channel_tasks"].get(iface)
+    if task is not None:
+        await task
+
+
+def _root_status(*ifaces):
+    """network_config.status()-shaped dict with adapters in root."""
+    return {"root": {iface: {"type": "monitor"} for iface in ifaces}}
+
+
+def _mock_root_adapters(mocker, *ifaces):
+    """Keep start_streaming / frequency discovery off the real iw path (AGENTS #6)."""
+    mocker.patch(
+        "wlanpi_core.streaming.connection_manager.network_config.status",
+        return_value=_root_status(*ifaces),
+    )
 
 
 @pytest.mark.asyncio
 async def test_supported_frequencies_uses_bounded_async_commands(mocker):
+    """Frequencies come from core adapter enumeration + per-phy iw channels,
+    never a root-only `iw dev` scrape (namespace-aware path)."""
     manager = ConnectionManager()
     websocket = object()
+    _mock_root_adapters(mocker, "wlanpi0")
+    mocker.patch(
+        "wlanpi_core.adapters.interface.get_interface_info",
+        return_value={"phy": "phy0"},
+    )
     run_command = mocker.patch.object(
         connection_manager,
         "run_command_async",
         new=AsyncMock(
-            side_effect=[
-                CommandResult("Interface wlanpi0\n", "", 0),
-                CommandResult("* 2412 MHz\n* 2437 MHz (disabled)\n", "", 0),
-            ]
+            return_value=CommandResult("* 2412 MHz\n* 2437 MHz (disabled)\n", "", 0),
         ),
     )
     send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
 
     await manager.send_supported_frequencies(websocket)
 
-    assert run_command.await_args_list == [
-        call(
-            [connection_manager.IW_FILE, "dev"],
-            timeout=connection_manager._IW_TIMEOUT_SEC,
-        ),
-        call(
-            [connection_manager.IW_FILE, "phy", "phy0", "channels"],
-            timeout=connection_manager._IW_TIMEOUT_SEC,
-        ),
-    ]
+    run_command.assert_awaited_once_with(
+        [connection_manager.IW_FILE, "phy", "phy0", "channels"],
+        timeout=connection_manager._IW_TIMEOUT_SEC,
+    )
     send_event.assert_awaited_once_with(
         websocket,
         "frequencies",
@@ -91,7 +133,7 @@ async def test_set_channel_uses_bounded_async_command(mocker):
         new=AsyncMock(return_value=CommandResult("", "", 0)),
     )
 
-    assert await manager._set_channel("wlanpi0", 5180, 20) is True
+    assert await manager._set_channel("wlanpi0", 5180, 20) is None
 
     run_command.assert_awaited_once_with(
         [connection_manager.IW_FILE, "dev", "wlanpi0", "set", "freq", "5180", "20"],
@@ -105,6 +147,7 @@ async def test_capture_process_is_isolated_and_reaped_on_stop(mocker):
     manager = ConnectionManager()
     websocket = object()
     _connected_client(manager, websocket)
+    _mock_root_adapters(mocker, "wlanpi0")
     process = CaptureProcess()
     create_process = mocker.patch.object(
         connection_manager.asyncio,
@@ -205,6 +248,7 @@ async def test_capture_interface_can_only_have_one_owner(mocker):
     second_websocket = object()
     _connected_client(manager, first_websocket)
     _connected_client(manager, second_websocket)
+    _mock_root_adapters(mocker, "wlanpi0")
     manager.configure(first_websocket, "wlanpi0", {})
     manager.configure(second_websocket, "wlanpi0", {})
     process = CaptureProcess()
@@ -240,6 +284,7 @@ async def test_shutdown_all_reaps_captures_and_discards_clients(mocker):
     manager = ConnectionManager()
     websocket = object()
     _connected_client(manager, websocket)
+    _mock_root_adapters(mocker, "wlanpi0")
     manager.configure(websocket, "wlanpi0", {})
     process = CaptureProcess()
     mocker.patch.object(
@@ -255,6 +300,7 @@ async def test_shutdown_all_reaps_captures_and_discards_clients(mocker):
     assert process.terminated is True
     assert manager.clients == {}
     assert manager.interface_owners == {}
+    assert manager.sessions == {}
 
 
 @pytest.mark.parametrize(
@@ -305,7 +351,173 @@ async def test_capture_rejects_invalid_start_before_process(mocker):
     )
 
 
+async def _running_capture(manager, mocker, websocket, channels, duration_sec=None):
+    """Start a capture with mocked process/iw and settle its first retune."""
+    _mock_root_adapters(mocker, "wlanpi0")
+    process = CaptureProcess()
+    create_process = mocker.patch.object(
+        connection_manager.asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    )
+    mocker.patch.object(manager, "send_message_event", new=AsyncMock())
+    set_channel = mocker.patch.object(
+        manager, "_set_channel", new=AsyncMock(return_value=None)
+    )
+    manager.configure(websocket, "wlanpi0", {"channels": channels})
+    await manager.start_streaming(websocket, ["wlanpi0"], "", duration_sec)
+    if len(channels) <= 1:
+        # Multi-channel plans hop forever; only a parked one can be awaited.
+        await _drain_channel_task(manager, websocket, "wlanpi0")
+    return process, create_process, set_channel
+
+
 @pytest.mark.asyncio
+async def test_configure_mid_capture_retunes_without_restarting_capture(mocker):
+    """The point of live reconfig: the new channel is tuned while the same
+    dumpcap process keeps streaming, so the pcapng byte stream has no gap and
+    the session id survives."""
+    manager = ConnectionManager()
+    websocket = object()
+    _connected_client(manager, websocket)
+    process, create_process, set_channel = await _running_capture(
+        manager, mocker, websocket, [{"freq": 2412, "width": 20}]
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    session_id = manager.clients[websocket]["session_id"]
+    set_channel.reset_mock()
+
+    await manager.apply_configuration(
+        websocket, _configs(wlanpi0={"channels": [{"freq": 5180, "width": 80}]})
+    )
+    await _drain_channel_task(manager, websocket, "wlanpi0")
+
+    set_channel.assert_awaited_once_with("wlanpi0", 5180, 80, None)
+    assert create_process.await_count == 1
+    assert process.terminated is False
+    assert manager.clients[websocket]["session_id"] == session_id
+
+    _, _, code, data = send_event.await_args_list[-1].args
+    assert code == "CONFIG_APPLIED"
+    assert data["applied_live"] == ["wlanpi0"]
+    assert data["deferred"] == []
+    assert data["session_id"] == session_id
+
+    await manager.stop_streaming(websocket, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_configure_while_idle_is_stored_and_reported_as_deferred(mocker):
+    manager = ConnectionManager()
+    websocket = object()
+    _connected_client(manager, websocket)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        websocket, _configs(wlanpi0={"channels": [{"freq": 2412, "width": 20}]})
+    )
+
+    assert manager.clients[websocket]["channel_tasks"] == {}
+    assert manager.clients[websocket]["configs"]["wlanpi0"]["channels"] == [
+        {"freq": 2412, "width": 20}
+    ]
+    _, _, code, data = send_event.await_args_list[-1].args
+    assert code == "CONFIG_APPLIED"
+    assert data["applied_live"] == []
+    assert data["deferred"] == ["wlanpi0"]
+
+
+@pytest.mark.asyncio
+async def test_live_retune_refreshes_session_config_and_tells_subscribers(mocker):
+    """A subscriber is blind to the frames' channel plan, so it must be told
+    when the owner retunes - and list_sessions must stop advertising the old
+    config."""
+    manager = ConnectionManager()
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+    session_id = manager.clients[owner]["session_id"]
+    await manager.subscribe(subscriber, session_id)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        owner,
+        _configs(
+            wlanpi0={"channels": [{"freq": 5180, "width": 80}], "dwell_time": 500}
+        ),
+    )
+    await _drain_channel_task(manager, owner, "wlanpi0")
+
+    running = manager.clients[owner]["session_config"]["interfaces"]["wlanpi0"]
+    assert running == {"channels": [{"freq": 5180, "width": 80}], "dwell_time": 500}
+
+    changed = [
+        call for call in send_event.await_args_list if call.args[2] == "CONFIG_CHANGED"
+    ]
+    assert len(changed) == 1
+    assert changed[0].args[0] is subscriber
+    assert changed[0].args[3]["config"]["interfaces"]["wlanpi0"] == running
+    assert manager.clients[subscriber]["subscribed_to"] == session_id
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_live_retune_to_empty_channel_list_parks_the_radio(mocker):
+    """An empty channel list means "stop hopping, stay put": the hop task goes
+    away without disturbing the capture."""
+    manager = ConnectionManager()
+    websocket = object()
+    _connected_client(manager, websocket)
+    process, _, _ = await _running_capture(
+        manager,
+        mocker,
+        websocket,
+        [{"freq": 2412, "width": 20}, {"freq": 2437, "width": 20}],
+    )
+    mocker.patch.object(manager, "send_event", new=AsyncMock())
+    hop_task = manager.clients[websocket]["channel_tasks"]["wlanpi0"]
+
+    await manager.apply_configuration(websocket, _configs(wlanpi0={"channels": []}))
+
+    assert manager.clients[websocket]["channel_tasks"] == {}
+    assert hop_task.done()
+    assert process.terminated is False
+
+    await manager.stop_streaming(websocket, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_set_channel_retries_once_when_phy_is_busy(mocker):
+    """A scan on a shared phy makes iw fail with EBUSY transiently; one
+    retry absorbs the common collision."""
+    manager = ConnectionManager()
+    busy = CommandResult("", "command failed: Device or resource busy (-16)", 240)
+    ok = CommandResult("", "", 0)
+    run = mocker.patch(
+        "wlanpi_core.streaming.connection_manager.run_command_async",
+        side_effect=[busy, ok],
+    )
+
+    assert await manager._set_channel("wlanpi0", 2412, 20) is None
+    assert run.call_count == 2
+
+
+async def test_set_channel_does_not_retry_non_busy_failures(mocker):
+    manager = ConnectionManager()
+    failed = CommandResult("", "command failed: Operation not supported (-95)", 240)
+    run = mocker.patch(
+        "wlanpi_core.streaming.connection_manager.run_command_async",
+        return_value=failed,
+    )
+
+    error = await manager._set_channel("wlanpi0", 2412, 20)
+    assert error is not None and "not supported" in error
+    assert run.call_count == 1
+
+
 async def test_set_channel_rejects_invalid_center_before_command(mocker):
     manager = ConnectionManager()
     run_command = mocker.patch.object(
@@ -314,5 +526,538 @@ async def test_set_channel_rejects_invalid_center_before_command(mocker):
         new=AsyncMock(),
     )
 
-    assert await manager._set_channel("wlanpi0", 5000, 160) is False
+    assert await manager._set_channel("wlanpi0", 5000, 160) is not None
     run_command.assert_not_awaited()
+
+
+# --- Session lifetime on the descriptor (P6.2) -----------------------------
+
+
+class _FakeClock:
+    """Injected in place of manager._clock; tests move `now` explicitly."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_capture_started_and_descriptor_report_elapsed_from_manager_clock(
+    mocker,
+):
+    """A subscriber can see how long a capture has been running. The clock is
+    the manager's injected attribute, so nothing here sleeps or patches `time`
+    (AGENTS #1, #7). A perpetual capture reports null duration/remaining."""
+    manager = ConnectionManager()
+    clock = _FakeClock(1000.0)
+    manager._clock = clock
+    owner = object()
+    _connected_client(manager, owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+    session_id = manager.clients[owner]["session_id"]
+
+    started = next(
+        call for call in send_event.await_args_list if call.args[2] == "CAPTURE_STARTED"
+    )
+    assert started.args[3]["elapsed_sec"] == 0
+    assert started.args[3]["duration_sec"] is None
+    assert started.args[3]["remaining_sec"] is None
+
+    clock.now = 1030.7
+    descriptor = manager._session_descriptor(session_id, owner)
+    assert descriptor["elapsed_sec"] == 30
+    assert descriptor["duration_sec"] is None
+    assert descriptor["remaining_sec"] is None
+
+    await manager.stop_streaming(owner, notify=False)
+    assert manager.clients[owner]["started_mono"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_list_and_subscribed_carry_lifetime_fields(mocker):
+    manager = ConnectionManager()
+    clock = _FakeClock(500.0)
+    manager._clock = clock
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+    session_id = manager.clients[owner]["session_id"]
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    clock.now = 512.2
+    await manager.send_session_list(subscriber)
+    await manager.subscribe(subscriber, session_id)
+
+    listing = next(
+        call for call in send_event.await_args_list if call.args[2] == "SESSIONS"
+    )
+    (session,) = listing.args[3]["sessions"]
+    assert session["session_id"] == session_id
+    assert session["elapsed_sec"] == 12
+    assert session["remaining_sec"] is None
+
+    subscribed = next(
+        call for call in send_event.await_args_list if call.args[2] == "SUBSCRIBED"
+    )
+    assert subscribed.args[3]["elapsed_sec"] == 12
+    assert subscribed.args[3]["duration_sec"] is None
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+# --- Bounded captures: duration_sec on start (P6.3) -------------------------
+
+
+class _FakeSleep:
+    """Injected as manager._sleep. Records the requested delay and blocks
+    until the test releases that delay, so expiry is driven by an event and
+    never by the wall clock (AGENTS #1). Keyed by delay because a detached
+    bounded capture has two sleepers: the deadline and the orphan grace."""
+
+    def __init__(self):
+        self.delays = []
+        self._events = {}
+
+    def release(self, delay):
+        self.event_for(delay).set()
+
+    def event_for(self, delay):
+        return self._events.setdefault(delay, asyncio.Event())
+
+    async def __call__(self, delay):
+        self.delays.append(delay)
+        await self.event_for(delay).wait()
+
+
+class EndingStdout:
+    """A capture process whose output ends as soon as it is read: the
+    dumpcap-exited path."""
+
+    async def read(self, size):
+        return b""
+
+
+def _events(send_event, code):
+    return [call for call in send_event.await_args_list if call.args[2] == code]
+
+
+@pytest.mark.parametrize("value", [None, 1, 300, MAX_CAPTURE_DURATION_SEC])
+def test_capture_start_accepts_valid_duration(value):
+    start = CaptureStart(interfaces=["wlanpi0"], duration_sec=value)
+    assert start.duration_sec == value
+
+
+@pytest.mark.parametrize(
+    "value", [0, -1, MAX_CAPTURE_DURATION_SEC + 1, True, 5.5, "300"]
+)
+def test_capture_start_rejects_invalid_duration(value):
+    with pytest.raises(ValueError):
+        CaptureStart(interfaces=["wlanpi0"], duration_sec=value)
+
+
+@pytest.mark.asyncio
+async def test_start_without_duration_is_perpetual(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+
+    client = manager.clients[owner]
+    assert client["deadline_task"] is None
+    assert manager._sleep.delays == []
+    lifetime = manager._lifetime_fields(client)
+    assert lifetime["duration_sec"] is None
+    assert lifetime["remaining_sec"] is None
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_invalid_duration_is_rejected_before_any_process_starts(mocker):
+    manager = ConnectionManager()
+    owner = object()
+    _connected_client(manager, owner)
+    _mock_root_adapters(mocker, "wlanpi0")
+    create_process = mocker.patch.object(
+        connection_manager.asyncio, "create_subprocess_exec", new=AsyncMock()
+    )
+    send_message_event = mocker.patch.object(
+        manager, "send_message_event", new=AsyncMock()
+    )
+    manager.configure(owner, "wlanpi0", {"channels": [{"freq": 2412, "width": 20}]})
+
+    await manager.start_streaming(owner, ["wlanpi0"], "", 0)
+
+    create_process.assert_not_awaited()
+    assert send_message_event.await_args.args[2] == "CAPTURE_CONFIG_INVALID"
+    assert manager.interface_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_bounded_capture_reports_duration_and_remaining(mocker):
+    manager = ConnectionManager()
+    clock = _FakeClock(100.0)
+    manager._clock = clock
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=300
+    )
+    session_id = manager.clients[owner]["session_id"]
+
+    (started,) = _events(send_event, "CAPTURE_STARTED")
+    assert started.args[3]["duration_sec"] == 300
+    assert started.args[3]["remaining_sec"] == 300
+    assert manager._sleep.delays == [300]
+
+    clock.now = 220.5
+    descriptor = manager._session_descriptor(session_id, owner)
+    assert descriptor["elapsed_sec"] == 120
+    assert descriptor["duration_sec"] == 300
+    assert descriptor["remaining_sec"] == 180
+
+    clock.now = 1000.0
+    assert manager._session_descriptor(session_id, owner)["remaining_sec"] == 0
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_duration_elapsed_stops_capture_and_tells_owner_and_subscriber(
+    mocker,
+):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=5
+    )
+    session_id = manager.clients[owner]["session_id"]
+    await manager.subscribe(subscriber, session_id)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    sleep.release(5)
+    await deadline_task
+
+    assert process.terminated is True
+    assert manager.sessions == {}
+    assert manager.interface_owners == {}
+    assert manager.clients[owner]["deadline_task"] is None
+    assert manager.clients[subscriber]["subscribed_to"] is None
+    stopped = _events(send_event, "CAPTURE_STOPPED")
+    assert {call.args[0] for call in stopped} == {owner, subscriber}
+    assert all(call.args[3]["reason"] == "DURATION_ELAPSED" for call in stopped)
+
+
+@pytest.mark.asyncio
+async def test_manual_stop_cancels_the_duration_timer(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    _connected_client(manager, owner)
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    await manager.stop_streaming(owner)
+
+    with pytest.raises(asyncio.CancelledError):
+        await deadline_task
+    assert manager.clients[owner]["deadline_task"] is None
+    (stopped,) = _events(send_event, "CAPTURE_STOPPED")
+    assert stopped.args[3]["reason"] == "OWNER_STOP"
+    # Releasing the sleep afterwards must not produce a second stop.
+    sleep.release(60)
+    await asyncio.sleep(0)
+    assert len(_events(send_event, "CAPTURE_STOPPED")) == 1
+
+
+@pytest.mark.asyncio
+async def test_perpetual_capture_dies_with_its_owner_and_says_so(mocker):
+    """No duration_sec: nobody else could stop or retune it, so the owner's
+    disconnect ends it even with a subscriber attached."""
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}]
+    )
+    await manager.subscribe(subscriber, manager.clients[owner]["session_id"])
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.disconnect(owner)
+
+    assert process.terminated is True
+    assert owner not in manager.clients
+    assert manager.sessions == {}
+    stopped = [
+        c for c in _events(send_event, "CAPTURE_STOPPED") if c.args[0] is subscriber
+    ]
+    assert len(stopped) == 1
+    assert stopped[0].args[3]["reason"] == "OWNER_DISCONNECT"
+
+
+@pytest.mark.asyncio
+async def test_process_exit_cancels_the_duration_timer(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    _mock_root_adapters(mocker, "wlanpi0")
+    process = CaptureProcess()
+    process.stdout = EndingStdout()
+    mocker.patch.object(
+        connection_manager.asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    )
+    mocker.patch.object(manager, "_set_channel", new=AsyncMock(return_value=None))
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    manager.configure(owner, "wlanpi0", {"channels": [{"freq": 2412, "width": 20}]})
+
+    await manager.start_streaming(owner, ["wlanpi0"], "", 60)
+    deadline_task = manager.clients[owner]["deadline_task"]
+    await manager.clients[owner]["task"]
+
+    assert manager.clients[owner]["deadline_task"] is None
+    with pytest.raises(asyncio.CancelledError):
+        await deadline_task
+    (ended,) = _events(send_event, "CAPTURE_ENDED")
+    assert ended.args[3]["reason"] == "PROCESS_EXITED"
+    assert manager.sessions == {}
+
+
+# --- Detached bounded captures (P6.4) ---------------------------------------
+
+
+class _Sock:
+    """Hashable socket stand-in with the two send methods the manager uses."""
+
+    def __init__(self):
+        self.send_bytes = AsyncMock()
+        self.send_text = AsyncMock()
+
+
+async def _detached_capture(manager, mocker, duration_sec=60, subscriber=None):
+    """A bounded capture whose owner socket has gone away."""
+    owner = _Sock()
+    _connected_client(manager, owner)
+    manager.clients[owner]["did"] = "owner-did"
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec
+    )
+    session_id = manager.clients[owner]["session_id"]
+    if subscriber is not None:
+        _connected_client(manager, subscriber)
+        await manager.subscribe(subscriber, session_id)
+    await manager.disconnect(owner)
+    await asyncio.sleep(0)  # let a freshly armed orphan watch reach its sleep
+    return owner, process, session_id
+
+
+@pytest.mark.asyncio
+async def test_bounded_capture_survives_owner_disconnect_while_subscribed(mocker):
+    """The point of P6.4: start bounded, hand the stream to a subscriber (a
+    saver process), disconnect - the capture and its subscriber carry on."""
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    manager._clock = _FakeClock(0.0)
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    client = manager.clients[owner]
+
+    assert process.terminated is False
+    assert manager.sessions == {session_id: owner}
+    assert client["owner_attached"] is False
+    assert client["orphan_task"] is None  # a listener is attached
+    descriptor = manager._session_descriptor(session_id, owner)
+    assert descriptor["owner_attached"] is False
+    assert descriptor["subscriber_count"] == 1
+    assert descriptor["remaining_sec"] == 60
+
+    await manager._broadcast_chunk(owner, client, b"pcapng")
+    subscriber.send_bytes.assert_awaited_once_with(b"pcapng")
+    owner.send_bytes.assert_not_awaited()
+
+    # Nothing is sent to the socket that is no longer there.
+    owner.send_text.reset_mock()
+    await manager.send_event(owner, "status", "X", {})
+    owner.send_text.assert_not_awaited()
+
+    await manager.stop_streaming(owner, notify=False)
+    assert owner not in manager.clients
+    assert manager.interface_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_detached_capture_with_no_listeners_stops_after_grace(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner, process, session_id = await _detached_capture(manager, mocker)
+    orphan_task = manager.clients[owner]["orphan_task"]
+
+    assert orphan_task is not None
+    assert connection_manager.ORPHAN_GRACE_SEC in sleep.delays
+    assert process.terminated is False  # not immediately: the grace is the point
+
+    sleep.release(connection_manager.ORPHAN_GRACE_SEC)
+    await orphan_task
+
+    assert process.terminated is True
+    assert owner not in manager.clients
+    assert manager.sessions == {}
+    assert manager.interface_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_subscribe_within_grace_cancels_orphan_timer(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner, process, session_id = await _detached_capture(manager, mocker)
+    orphan_task = manager.clients[owner]["orphan_task"]
+    late_child = _Sock()
+    _connected_client(manager, late_child)
+
+    await manager.subscribe(late_child, session_id)
+
+    assert manager.clients[owner]["orphan_task"] is None
+    with pytest.raises(asyncio.CancelledError):
+        await orphan_task
+    assert process.terminated is False
+    assert manager.clients[late_child]["subscribed_to"] == session_id
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_last_subscriber_leaving_a_detached_session_arms_orphan_timer(
+    mocker,
+):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    assert manager.clients[owner]["orphan_task"] is None
+
+    await manager.unsubscribe(subscriber)
+
+    orphan_task = manager.clients[owner]["orphan_task"]
+    assert orphan_task is not None
+    sleep.release(connection_manager.ORPHAN_GRACE_SEC)
+    await orphan_task
+    assert process.terminated is True
+    assert owner not in manager.clients
+
+
+@pytest.mark.asyncio
+async def test_stop_by_session_id_requires_the_owners_did(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    stranger = _Sock()
+    _connected_client(manager, stranger)
+    manager.clients[stranger]["did"] = "someone-else"
+    same_did = _Sock()
+    _connected_client(manager, same_did)
+    manager.clients[same_did]["did"] = "owner-did"
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    send_message_event = mocker.patch.object(
+        manager, "send_message_event", new=AsyncMock()
+    )
+
+    await manager.stop_session(stranger, session_id)
+    assert send_message_event.await_args.args[2] == "SESSION_NOT_OWNED"
+    assert process.terminated is False
+
+    await manager.stop_session(same_did, "cap_nope")
+    assert send_message_event.await_args.args[2] == "SESSION_NOT_FOUND"
+
+    await manager.stop_session(same_did, session_id)
+    assert process.terminated is True
+    assert manager.sessions == {}
+    assert owner not in manager.clients
+    stopped = _events(send_event, "CAPTURE_STOPPED")
+    assert {call.args[0] for call in stopped} == {subscriber, same_did}
+    assert all(call.args[3]["reason"] == "OWNER_STOP" for call in stopped)
+    requester = next(call for call in stopped if call.args[0] is same_did)
+    assert requester.args[3]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_deadline_still_fires_on_a_detached_session(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, duration_sec=30, subscriber=subscriber
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    deadline_task = manager.clients[owner]["deadline_task"]
+
+    sleep.release(30)
+    await deadline_task
+
+    assert process.terminated is True
+    assert owner not in manager.clients
+    assert manager.sessions == {}
+    (stopped,) = _events(send_event, "CAPTURE_STOPPED")
+    assert stopped.args[0] is subscriber
+    assert stopped.args[3]["reason"] == "DURATION_ELAPSED"
+
+
+@pytest.mark.asyncio
+async def test_owner_send_failure_detaches_bounded_but_ends_perpetual(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+
+    bounded = _Sock()
+    bounded.send_bytes.side_effect = RuntimeError("gone")
+    _connected_client(manager, bounded)
+    _connected_client(manager, subscriber)
+    process, _, _ = await _running_capture(
+        manager, mocker, bounded, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    await manager.subscribe(subscriber, manager.clients[bounded]["session_id"])
+    await manager._broadcast_chunk(bounded, manager.clients[bounded], b"x")
+    assert manager.clients[bounded]["owner_attached"] is False
+    subscriber.send_bytes.assert_awaited_once_with(b"x")
+    assert process.terminated is False
+    await manager.stop_streaming(bounded, notify=False)
+
+    perpetual = _Sock()
+    perpetual.send_bytes.side_effect = RuntimeError("gone")
+    _connected_client(manager, perpetual)
+    await _running_capture(manager, mocker, perpetual, [{"freq": 2412, "width": 20}])
+    with pytest.raises(RuntimeError):
+        await manager._broadcast_chunk(perpetual, manager.clients[perpetual], b"x")
+    await manager.stop_streaming(perpetual, notify=False)

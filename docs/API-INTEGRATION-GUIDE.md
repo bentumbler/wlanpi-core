@@ -365,51 +365,166 @@ Blinker runs until stopped (cable-finder LED pattern on Ethernet).
 
 **Endpoint:** `WS /api/v1/streaming/capture`
 
-### Workflow
+Live Wi-Fi capture: send JSON **text** commands, receive JSON **events** and
+binary **pcapng** frames. One authenticated connection owns a capture; other
+authenticated connections can subscribe to it read-only.
 
-1. Open WebSocket (no auth today — privileged operation).
-2. Send JSON commands as **text** frames.
-3. Receive JSON **events** and binary **pcapng** data.
+> Through nginx the URL is `wss://<host>/api/v1/streaming/capture` on the TLS
+> front-end, or `ws://<host>:31415/...` on the plain port. Tokens go in the
+> first message, **never** in the URL (query strings are logged; a `?token=`
+> connection is refused with close code 4401).
 
-### Commands
+### 11.1 Authenticate (first message, required)
+
+The first frame MUST authenticate within 10 seconds, or the socket closes with
+code **4401**:
 
 ```json
-{ "command": "get_supported_frequencies" }
+{ "command": "auth", "token": "<core JWT from Lesson 1>" }
+```
+
+Reply: `{"type":"event","event":"status","code":"AUTH_OK","data":{"did":"…"}}`.
+An invalid/expired token, a non-auth first message, or a timeout closes 4401.
+
+### 11.2 Own a capture
+
+```json
+{ "command": "configure",
+  "interfaces": { "wlanpi0": { "channels": [{"freq": 5180, "width": 20}],
+                               "dwell_time": 250 } } }
 ```
 
 ```json
-{
-  "command": "configure",
-  "interfaces": {
-    "wlanpi0": { "channels": [36, 40, 44], "dwell": 250 }
-  }
-}
+{ "command": "start", "interfaces": ["wlanpi0"], "pcap_filter": "" }
 ```
+
+`width` ∈ {20,40,80,160}; `dwell_time` 50–60000 ms. Interface names are the
+monitor VIFs (`wlanpiN`); core runs the capture in whatever namespace the
+adapter lives in. `start` replies `CAPTURE_STARTED` with a `session_id`
+(`cap_xxxx`), the `interfaces`, the `namespace`, the running `config`, and the
+lifetime fields (`elapsed_sec`, `duration_sec`, `remaining_sec`).
+Then binary pcapng frames stream until `{ "command": "stop" }`, the socket
+closes, or the capture ends (`CAPTURE_ENDED`). Only the owning connection can
+`configure`/`stop`.
+
+**Bounded capture.** Add `"duration_sec": 300` (1–3600) to `start` and core
+stops the capture itself when the time is up — no client-side sleep-then-stop,
+and every subscriber can see the plan in `duration_sec`/`remaining_sec`. Omit
+it and the capture is perpetual, exactly as before. Every end says why:
+`CAPTURE_STOPPED` carries `data.reason` = `OWNER_STOP`, `OWNER_DISCONNECT` or
+`DURATION_ELAPSED`; `CAPTURE_ENDED` (dumpcap exited) carries `PROCESS_EXITED`.
+The duration cannot be changed on a running capture.
+
+### 11.3 Retune mid-capture
+
+Send `configure` again while the capture runs to change the channel list or
+dwell of an interface it already owns — narrow the hop list once you have found
+the BSS, or park on one channel:
 
 ```json
-{
-  "command": "start",
-  "interfaces": ["wlanpi0"],
-  "pcap_filter": ""
-}
+{ "command": "configure",
+  "interfaces": { "wlanpi0": { "channels": [{"freq": 5180, "width": 80}] } } }
 ```
+
+This is gapless: the capture process is never restarted, so the pcapng stream
+continues uninterrupted, the `session_id` stays the same, and subscribers stay
+attached (they get a `CONFIG_CHANGED` event carrying the new config). A single
+channel parks the radio; an empty `channels` list stops hopping and leaves the
+radio where it is.
+
+`CONFIG_APPLIED` reports exactly what happened, so you never have to guess
+whether a change is in effect yet:
 
 ```json
-{ "command": "stop" }
+{ "type": "event", "event": "config", "code": "CONFIG_APPLIED",
+  "data": { "applied_live": ["wlanpi0"], "deferred": ["wlanpi1"],
+            "session_id": "cap_ab12cd34", "message": "…" } }
 ```
 
-### Event shape (simplified)
+Interfaces that are not part of the running capture land in `deferred` and take
+effect at the next `start`. The interface set and `pcap_filter` are fixed when
+the capture process launches, so changing either still means `stop` then
+`start` (which ends the session and detaches subscribers).
+
+### 11.4 Subscribe to someone else's capture (read-only)
+
+Discover running captures, then attach — you do **not** need the owner's
+command or `session_id` in advance:
 
 ```json
-{
-  "type": "event",
-  "category": "error",
-  "code": "UNKNOWN_COMMAND",
-  "message": "Unsupported command: foo"
-}
+{ "command": "list_sessions" }
 ```
 
-**Planned:** REST session API with token-gated subscriber WebSocket — see `docs/P0-wifi-capture-api.md` (design only).
+Reply `SESSIONS` lists each capture with `session_id`, `owner`, `interfaces`,
+`namespace`, `config`, and how long it has run: `elapsed_sec` (integer seconds,
+computed when the event is sent), plus `duration_sec` and `remaining_sec`,
+which are `null` for a perpetual capture (one that runs until the owner stops
+it). Pick the one on the interface you want (one owner per interface) and:
+
+```json
+{ "command": "subscribe", "session_id": "cap_ab12cd34" }
+```
+
+`SUBSCRIBED` returns that session's full descriptor: the `config` (so you know
+the channels/filter you are receiving) and the lifetime fields (so you know how
+long it has been running), then the same binary pcapng stream arrives. A subscriber
+cannot control the capture; `{ "command": "unsubscribe" }` detaches. When the
+capture ends for any reason, subscribers get `CAPTURE_STOPPED` (with
+`data.reason`) or `CAPTURE_ENDED`.
+
+### 11.5 Bounded and detached captures
+
+A **perpetual** capture (no `duration_sec`) lives with its owner's socket:
+when that socket closes the capture stops at once, subscribers or not, because
+nobody else could stop or retune it.
+
+A **bounded** capture (`duration_sec` set) belongs to the owner's `did`, not
+to the socket. If the owner's socket closes, the capture keeps running for
+whoever is listening — the descriptor then shows `"owner_attached": false` and
+a `subscriber_count` — and ends when one of these happens first:
+
+| End | Reason on `CAPTURE_STOPPED` |
+|---|---|
+| the deadline is reached | `DURATION_ELAPSED` |
+| `{ "command": "stop", "session_id": "cap_…" }` from any connection authenticated as the owner's `did` | `OWNER_STOP` |
+| nobody has been attached (owner or subscriber) for a short grace period (15 s) | `NO_LISTENERS` |
+
+This is what makes "start a bounded capture, hand it to a child process that
+subscribes and saves the stream, exit" work: the child subscribes within the
+grace window and the capture runs to its deadline. A capture with no listeners
+is not kept alive — the radio would be hopping into nowhere. Another
+connection with a different `did` asking to stop it gets `SESSION_NOT_OWNED`.
+
+While a detached capture holds an interface, a new `start` on that interface
+fails with `INTERFACE_IN_USE` as usual; stop the old session by `session_id`
+first (or subscribe to it instead — a reconnected owner may subscribe to its
+own detached session).
+
+### 11.6 Other commands & events
+
+`{ "command": "get_supported_frequencies" }` → `SUPPORTED_FREQUENCIES` (channel
+list per capture adapter). Event shape:
+
+```json
+{ "type": "event", "event": "status", "code": "CAPTURE_STARTED",
+  "data": { "session_id": "cap_ab12", "interfaces": ["wlanpi0"],
+            "namespace": null, "config": { … } } }
+```
+
+Notable codes: `AUTH_OK`, `AUTH_FAILED`, `CAPTURE_STARTED`, `CHANNEL_SET` /
+`CHANNEL_SET_FAILED` (hop status; the failure message carries the `iw` reason —
+on single-radio devices the phy can be briefly busy while the managed interface
+scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
+(sent to subscribers after a live retune), `CAPTURE_STOPPED` /
+`CAPTURE_ENDED` (with `data.reason`, see 11.2 and 11.5), and errors
+`INTERFACE_IN_USE`, `INTERFACE_NOT_AVAILABLE`, `SESSION_NOT_FOUND`,
+`SESSION_NOT_OWNED`, `CONFIG_INVALID`,
+`CAPTURE_CONFIG_INVALID` (bad `start`, e.g. `duration_sec` out of range),
+`UNKNOWN_COMMAND`.
+
+**Reference client:** `tools/capture_harness/` implements this whole flow
+(owner, subscriber-by-interface, and pcapng dissection). **MCP integration:**
+`docs/capture-ws-mcp-handover.md`.
 
 ---
 
