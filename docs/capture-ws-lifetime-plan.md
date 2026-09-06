@@ -161,6 +161,11 @@ a bounded capture detaches rather than ends.
 
 | PR | Branch | State |
 |---|---|---|
-| P6.2 | `feature/capture-descriptor-clock-p62` | in progress |
-| P6.3 | `feature/capture-duration-p63` | planned |
-| P6.4 | `feature/capture-detach-p64` | planned |
+| P6.2 | `feature/capture-descriptor-clock-p62` | implemented (2026-09-07); fork PR into P6.1, upstream after #165 |
+| P6.3 | `feature/capture-duration-p63` | implemented (2026-09-07); fork PR into P6.2. `remaining_sec` is a ceiling so a fresh capture says "60 left", not 59 |
+| P6.4 | `feature/capture-detach-p64` | implemented (2026-09-07); fork PR into P6.3. Merged to `integration/mcp-prague` for device testing |
+
+Device verification still to do on a WLAN Pi (unit tests mock dumpcap/iw):
+owner `--duration 20` ends with `DURATION_ELAPSED`; subscriber keeps receiving
+after the owner's Ctrl-C on a bounded capture; a lone detached capture stops
+after the 15 s grace; `stop` by `session_id` from a second harness instance.
