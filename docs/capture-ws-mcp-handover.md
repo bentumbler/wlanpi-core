@@ -41,7 +41,7 @@ timeout / a token in the URL). After that:
 | `get_supported_frequencies` | `{}` | channel list the device supports |
 | `configure` | `{"interfaces": {"wlanpi0": {"channels": [{"freq": 2412, "width": 20}], "dwell_time": 250}}}` | per-interface config; `width` ∈ {20,40,80,160}, `dwell_time` 50–60000 ms |
 | `start` | `{"interfaces": ["wlanpi0"], "pcap_filter": "", "duration_sec": 300}` | begins capture; interfaces must be configured first. `duration_sec` (1–3600) is optional: core stops the capture itself when it elapses; omit for a perpetual capture |
-| `stop` | `{}` | owner only |
+| `stop` | `{}` or `{"session_id": "cap_xxxx"}` | own capture; or a session owned by this `did` (how a detached capture is stopped from a new connection) |
 | `subscribe` | `{"session_id": "cap_xxxx"}` | listen read-only to another socket's capture |
 | `unsubscribe` | `{}` | detach |
 | `list_sessions` | `{}` | enumerate running captures **with their running config** and lifetime (`elapsed_sec`, `duration_sec`, `remaining_sec`) |
@@ -57,30 +57,45 @@ Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
   `data.interfaces`), `CHANNEL_SET` / `CHANNEL_SET_FAILED` (hop status; failure
   `data.message` carries the `iw` reason), `SUBSCRIBED`, `SESSIONS`
   (`data.sessions`), `CAPTURE_STOPPED` / `CAPTURE_ENDED` (`data.reason` ∈
-  `OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`, `PROCESS_EXITED`), and `error` events
-  (`AUTH_FAILED`, `INTERFACE_IN_USE`, `SESSION_NOT_FOUND`, `CONFIG_INVALID`, …).
+  `OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`, `NO_LISTENERS`,
+  `PROCESS_EXITED`), and `error` events
+  (`AUTH_FAILED`, `INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED`,
+  `STOP_REQUIRES_SESSION`, `SESSION_NOT_FOUND`,
+  `CONFIG_INVALID`, …).
 
 ---
 
 ## 2. Identity and ownership model (read this before designing tools)
 
 - The connection's principal is the **`did`** from the verified JWT. Core binds
-  each running capture to the owning socket; only that socket can
-  `configure`/`stop` it. Any *other* authenticated connection may `subscribe`
-  read-only (device-open reads — see Appendix A policy A).
-- **The capture lives with its owning socket.** If the socket closes, the
-  capture stops and subscribers are detached. There is no detached/durable
-  capture that outlives its connection.
+  each running capture to its owner; only the **attached** owning socket can
+  `configure` it. `stop` is that socket, or (once detached) any socket
+  authenticated as the same `did` by `session_id`. Any *other* authenticated
+  connection may `subscribe` read-only (device-open reads — see Appendix A
+  policy A). A detached session cannot be retuned; stop it and start a new
+  capture to change the radio. `configure`/`start` on an interface it holds
+  is `CONTROL_NOT_ALLOWED`. Reconnect with `list_sessions` to see it. Bare
+  `stop` on a new connection is `STOP_REQUIRES_SESSION`; use `session_id`.
+- **A perpetual capture lives with its owning socket.** If the socket closes,
+  the capture stops and subscribers are detached (`OWNER_DISCONNECT`).
+- **A bounded capture (`duration_sec`) lives with its `did`.** If the owner's
+  socket closes it keeps running for its subscribers (descriptor:
+  `owner_attached: false`) until its deadline (`DURATION_ELAPSED`), a `stop`
+  by `session_id` from the same `did` (`OWNER_STOP`), or a 15 s grace with
+  nobody attached (`NO_LISTENERS`). The cap on `duration_sec` (3600) bounds
+  how long an abandoned capture can hold a radio. Design and rationale:
+  [`capture-ws-lifetime-plan.md`](./capture-ws-lifetime-plan.md).
 - **Revocation** stops new connections and new captures immediately, but does
-  **not** tear down a socket that is already streaming (documented Prague
-  semantic; see Appendix A decision 3).
+  **not** tear down a socket that is already streaming, nor a detached bounded
+  capture (documented Prague semantic; see Appendix A decision 3).
 
-Implication for MCP: a capture is only alive while MCP holds the WebSocket. Map
-this to explicit tool-invocation lifetime, not a background daemon that
-outlives a request — and never a protocol session id used as an auth cookie
-(the auth plan §2.2 forbids that). If MCP needs "start now, read later", MCP
-itself must hold the socket open and expose a handle; do not expect core to
-keep an ownerless capture.
+Implication for MCP: for summary tools, keep a capture's lifetime tied to the
+tool invocation (hold the socket, `stop` in a `finally`). For "start now,
+collect later", start a **bounded** capture with `duration_sec`, have the
+collector `subscribe` before the starter disconnects (or within the grace),
+and stop it early by `session_id` if needed — never a protocol session id used
+as an auth cookie (the auth plan §2.2 forbids that). Do not expect core to
+keep a perpetual capture without its owner.
 
 
 - **Namespaces:** core moves capture adapters into network namespaces (the
@@ -101,14 +116,14 @@ an existing one, and it must tell its caller which it did.
 1. Send `list_sessions`. Each returned session carries `session_id`, `owner`
    (the did), `interfaces`, `namespace` (which netns the capture runs in;
    `null` for root), the full running `config` (per-interface
-   channels/width/dwell + `pcap_filter`), and its lifetime: `elapsed_sec`
-   (integer seconds so far), `duration_sec` and `remaining_sec` (`null` for a
-   perpetual capture, i.e. one that runs until its owner stops it).
+   channels/width/dwell + `pcap_filter`), lifetime fields, `owner_attached`,
+   and `subscriber_count`. A reconnecting owner of a bounded capture uses this
+   to notice a session that outlived their last socket.
 2. If a session already captures on the interface MCP wants:
-   - MCP **cannot** also own that interface — a `start` will fail with
-     `INTERFACE_IN_USE`. So MCP either subscribes to observe it, or reports the
-     conflict. Which one is a tool-design choice; make it explicit, don't retry
-     blindly.
+   - MCP **cannot** also own that interface. An **attached** capture: `start`
+     fails `INTERFACE_IN_USE`. A **detached** capture: `configure`/`start` fail
+     `CONTROL_NOT_ALLOWED` (listen or stop only; stop then start new to change
+     the radio). Don't retry blindly.
    - To observe: `subscribe` with that `session_id`. The `SUBSCRIBED` event
      returns the same `config`, so MCP (and its caller) know exactly what is
      being received — channels, width, dwell, filter — rather than guessing
@@ -219,8 +234,10 @@ tools use the same user JWT flow as the rest of MCP.
    devices hopping can fail while the managed interface scans (see §7).
 8. Subscriber tool: `subscribe` with a `session_id` from `list_sessions`;
    otherwise identical consumption.
-9. Never keep an ownerless background capture; tie capture lifetime to the tool
-   invocation (or to MCP explicitly holding the socket for a handle it owns).
+9. Never leave a perpetual capture running without its owner; tie its lifetime
+   to the tool invocation. A background capture must be bounded
+   (`duration_sec`) and have a subscriber, and MCP should record the
+   `session_id` so it can `stop` it early.
 
 ---
 
@@ -262,6 +279,6 @@ user this rather than presenting a silent partial capture as complete.
 - Revocation vs live sockets: if a captured/leaked token must immediately kill
   an in-flight MCP capture stream, that is a core change (Appendix A decision
   3), currently "beyond Prague".
-- Durable/detached captures (start now, collect later without holding the
-  socket): not supported today; needs the REST session design, out of Prague
-  scope.
+- Durable/detached captures: supported for **bounded** captures only (P6.4,
+  see §2). A perpetual detached capture, or one with no listeners, remains
+  unsupported by design.

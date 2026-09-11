@@ -108,23 +108,38 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     | `get_supported_frequencies` | `{}` | Returns supported channel list |
     | `configure` | `{ "interfaces": { "wlanpi0": {…} } }` | Per-interface capture config |
     | `start` | `{ "interfaces": ["wlanpi0"], "pcap_filter": "…", "duration_sec": 300 }` | Begin streaming (`duration_sec` optional) |
-    | `stop` | `{}` | Stop capture for this client |
+    | `stop` | `{}` or `{ "session_id": "cap_…" }` | Bare `stop` ends this socket's **attached** capture only. After detach, `session_id` is required (`STOP_REQUIRES_SESSION` otherwise). |
 
     **Bounded captures:** `duration_sec` (1–3600) makes core stop the capture
     itself when the time is up; omit it for a perpetual capture that runs until
     `stop` or the socket closes. `CAPTURE_STOPPED` / `CAPTURE_ENDED` carry
     `data.reason` (`OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`,
-    `PROCESS_EXITED`) so clients can tell a timer from a user stop.
+    `PROCESS_EXITED`, `NO_LISTENERS`) so clients can tell a timer from a user
+    stop.
+
+    **Detached captures:** a bounded capture belongs to its `did`, not its
+    socket. If the owner's socket closes it keeps running for its subscribers
+    until its deadline, until `stop` with its `session_id` from any connection
+    authenticated as the same `did`, or until it has had no listeners for a
+    short grace period (`NO_LISTENERS`). A perpetual capture still stops the
+    moment its owner's socket closes. Detach is **listen/stop only**:
+    `configure` or `start` on an interface the detached session holds is
+    `CONTROL_NOT_ALLOWED`. Bare `{"command": "stop"}` on a reconnect is
+    `STOP_REQUIRES_SESSION` (payload lists that principal's session ids).
+    Reconnect, `list_sessions`, then subscribe or stop with `session_id`.
+    The only way to regain radio control is to stop that session and start a
+    new capture.
 
     **Reconfiguring mid-stream:** `configure` may be sent while a capture is
-    running. Interfaces belonging to the running capture are retuned in place -
-    the channel list and dwell take effect immediately, with no gap in the
-    pcapng stream, no new `session_id`, and no disturbance to subscribers.
-    Interfaces not in the running capture are stored for the next `start`. The
-    `CONFIG_APPLIED` reply reports both sets as `applied_live` and `deferred`;
-    subscribers of a retuned capture receive `CONFIG_CHANGED`. Changing the
-    interface set or `pcap_filter` still needs `stop` then `start`, since both
-    are fixed when the capture process is launched.
+    running **and this socket is still the attached owner**. Interfaces
+    belonging to the running capture are retuned in place - the channel list
+    and dwell take effect immediately, with no gap in the pcapng stream, no
+    new `session_id`, and no disturbance to subscribers. Interfaces not in the
+    running capture are stored for the next `start`. The `CONFIG_APPLIED`
+    reply reports both sets as `applied_live` and `deferred`; subscribers of a
+    retuned capture receive `CONFIG_CHANGED`. Changing the interface set or
+    `pcap_filter` still needs `stop` then `start`, since both are fixed when
+    the capture process is launched.
 
     **Auth:** required. The first message must be
     `{ "command": "auth", "token": "<core JWT>" }` (within 10s); anything else,
@@ -132,15 +147,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     code 4401. All later commands run as the authenticated principal (`did`).
 
     **Sessions & subscribers:** `start` returns a `session_id` in the
-    `CAPTURE_STARTED` event. Any other authenticated connection may
+    `CAPTURE_STARTED` event (same session descriptor as `SESSIONS` /
+    `SUBSCRIBED`). Any other authenticated connection may
     `{ "command": "subscribe", "session_id": … }` to receive the same binary
-    stream read-only (`list_sessions` enumerates running captures); only the
-    owning connection can `configure`/`stop`. `unsubscribe` detaches. Session
-    descriptors (`SESSIONS`, `SUBSCRIBED`, `CAPTURE_STARTED`) carry the running
-    `config` plus `elapsed_sec`; `duration_sec`/`remaining_sec` are `null` for
-    a perpetual capture.
+    stream read-only (`list_sessions` enumerates running captures). Only the
+    attached owning connection can `configure`. `stop` is that connection, or
+    any connection of the same `did` with `session_id` once the capture is
+    detached. `unsubscribe` detaches. Descriptors carry the running `config`,
+    lifetime fields (`elapsed_sec`; `duration_sec`/`remaining_sec` are `null`
+    for a perpetual capture), `owner_attached`, and `subscriber_count`.
 
-    **Long-running:** keep connection open for entire capture session; use `stop` before disconnect.
+    **Long-running:** a perpetual capture dies with its owner socket. A bounded
+    capture may outlive that socket; use `stop` with `session_id` to end it
+    early.
 
     **Replacement (planned):** REST `/wifi/capture/sessions` + subscriber WebSocket with token.
     """
@@ -201,7 +220,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
 
             elif command == "stop":
-                await manager.stop_streaming(websocket)
+                await manager.stop_session(websocket, data.get("session_id"))
 
             elif command == "subscribe":
                 await manager.subscribe(websocket, data.get("session_id"))

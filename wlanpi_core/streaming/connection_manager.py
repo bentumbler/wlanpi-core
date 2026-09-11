@@ -30,7 +30,12 @@ _STOP_MESSAGES = {
     "OWNER_STOP": "Capture stopped.",
     "OWNER_DISCONNECT": "Capture stopped: owner disconnected.",
     "DURATION_ELAPSED": "Capture stopped: duration elapsed.",
+    "NO_LISTENERS": "Capture stopped: no listeners remained.",
 }
+#: How long a detached bounded capture may run with nobody attached before it
+#: is stopped. Covers "start, fork a saver, exit" racing the child's subscribe,
+#: and a quick reconnect, without leaving a radio hopping into nowhere.
+ORPHAN_GRACE_SEC = 15
 
 
 class ConnectionManager:
@@ -61,6 +66,10 @@ class ConnectionManager:
             "duration_sec": None,
             "deadline_task": None,
             "stop_reason": None,
+            # False once a bounded capture's owner socket has gone away; the
+            # record then lives on as the session until it ends (P6.4).
+            "owner_attached": True,
+            "orphan_task": None,
             "namespace": None,
             "subscribers": set(),
             "subscribed_to": None,
@@ -120,6 +129,197 @@ class ConnectionManager:
             owner_client = self.clients.get(owner_ws)
             if owner_client:
                 owner_client["subscribers"].discard(websocket)
+                self._arm_orphan_if_unattended(owner_ws, owner_client)
+
+    # -- Detached bounded captures (P6.4) ---------------------------------
+    #
+    # A bounded capture belongs to a did, not a socket. When its owner's socket
+    # goes away it keeps running - detached - until its deadline, an explicit
+    # stop from the owner's did, or a grace period with nobody listening. A
+    # perpetual capture still dies with its owner: nobody else could stop or
+    # retune it, so nothing may keep it alive.
+
+    @staticmethod
+    def _is_detachable(client: Dict[str, Any]) -> bool:
+        return client.get("duration_sec") is not None
+
+    def _detached_holder(
+        self, websocket: WebSocket, interfaces
+    ) -> Optional[Tuple[WebSocket, Dict[str, Any], str]]:
+        """If any named interface is held by a detached session this socket
+        does not own as the attached owner, return that session. Used to
+        refuse configure/start: detach is listen/stop only."""
+        for iface in interfaces:
+            owner_ws = self.interface_owners.get(iface)
+            if owner_ws is None or owner_ws is websocket:
+                continue
+            owner_client = self.clients.get(owner_ws) or {}
+            session_id = owner_client.get("session_id")
+            if session_id and not owner_client.get("owner_attached", True):
+                return owner_ws, owner_client, session_id
+        return None
+
+    async def _reject_control_of_detached(
+        self, websocket: WebSocket, interfaces
+    ) -> bool:
+        """Refuse configure/start on interfaces a detached session holds.
+
+        Returns True after sending CONTROL_NOT_ALLOWED. Regain control only
+        by stopping that session and starting a new capture.
+        """
+        held = self._detached_holder(websocket, interfaces)
+        if held is None:
+            return False
+        _, owner_client, session_id = held
+        requester_did = (self.clients.get(websocket) or {}).get("did")
+        same_owner = (
+            requester_did is not None and requester_did == owner_client.get("did")
+        )
+        allowed = ["subscribe", "list_sessions"]
+        if same_owner:
+            allowed.append("stop")
+            message = (
+                f"Session {session_id} is detached; no control except stop. "
+                "Subscribe to listen, or list_sessions. To change the radio, "
+                f'stop it with {{"command": "stop", "session_id": "{session_id}"}} '
+                "and start a new capture."
+            )
+        else:
+            message = (
+                f"Session {session_id} is detached; only its owner may stop it. "
+                "Subscribe to listen, or list_sessions."
+            )
+        await self.send_event(
+            websocket,
+            "error",
+            "CONTROL_NOT_ALLOWED",
+            {
+                "message": message,
+                "session_id": session_id,
+                "owner_attached": False,
+                "allowed": allowed,
+            },
+        )
+        return True
+
+    def _detach_owner(self, owner_ws: WebSocket, client: Dict[str, Any]) -> None:
+        client["owner_attached"] = False
+        self._arm_orphan_if_unattended(owner_ws, client)
+
+    def _arm_orphan_if_unattended(
+        self, owner_ws: WebSocket, client: Dict[str, Any]
+    ) -> None:
+        if client.get("owner_attached", True) or client.get("subscribers"):
+            return
+        if not client.get("session_id") or client.get("orphan_task") is not None:
+            return
+        client["orphan_task"] = asyncio.create_task(self._orphan_watch(owner_ws))
+
+    def _cancel_orphan(self, client: Dict[str, Any]) -> None:
+        task = client.get("orphan_task")
+        client["orphan_task"] = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _orphan_watch(self, owner_ws: WebSocket) -> None:
+        await self._sleep(ORPHAN_GRACE_SEC)
+        client = self.clients.get(owner_ws)
+        if client is None or client.get("orphan_task") is not asyncio.current_task():
+            return
+        client["orphan_task"] = None
+        if client.get("owner_attached", True) or client.get("subscribers"):
+            return  # someone attached during the grace; the session goes on
+        await self.stop_streaming(owner_ws, notify=False, reason="NO_LISTENERS")
+
+    def _drop_if_detached(self, owner_ws: WebSocket, client: Dict[str, Any]) -> None:
+        """A detached owner's record only existed to carry the session; once
+        the session has ended there is no socket left to serve."""
+        if not client.get("owner_attached", True):
+            self.clients.pop(owner_ws, None)
+
+    async def stop_session(
+        self, websocket: WebSocket, session_id: Optional[str]
+    ) -> None:
+        """`stop`: without a session_id, stop this socket's attached capture.
+        A reconnecting socket is not the attached owner, so a bare stop is
+        `STOP_REQUIRES_SESSION` (never a fake CAPTURE_STOPPED). With a
+        session_id, stop that session if this socket owns it or shares the
+        owner's did.
+        """
+        if session_id is None:
+            client = self.clients.get(websocket)
+            if (
+                client
+                and self._is_capturing(client)
+                and client.get("owner_attached", True)
+            ):
+                await self.stop_streaming(websocket)
+                return
+            did = (client or {}).get("did")
+            owned = sorted(
+                sid
+                for sid, owner_ws in self.sessions.items()
+                if did
+                and (self.clients.get(owner_ws) or {}).get("did") == did
+            )
+            if len(owned) == 1:
+                message = (
+                    "This connection has no attached capture. Stop a detached "
+                    f'session with {{"command": "stop", "session_id": "{owned[0]}"}}.'
+                )
+            elif owned:
+                message = (
+                    "This connection has no attached capture. Stop a session "
+                    'with {"command": "stop", "session_id": "<id>"}.'
+                )
+            else:
+                message = "This connection has no attached capture to stop."
+            await self.send_event(
+                websocket,
+                "error",
+                "STOP_REQUIRES_SESSION",
+                {"message": message, "sessions": owned},
+            )
+            return
+        owner_ws = self.sessions.get(session_id)
+        if owner_ws is None:
+            await self.send_message_event(
+                websocket,
+                "error",
+                "SESSION_NOT_FOUND",
+                f"No running capture session: {session_id}",
+            )
+            return
+        if owner_ws is websocket:
+            await self.stop_streaming(websocket)
+            return
+        requester_did = (self.clients.get(websocket) or {}).get("did")
+        owner_did = (self.clients.get(owner_ws) or {}).get("did")
+        if requester_did is None or requester_did != owner_did:
+            await self.send_message_event(
+                websocket,
+                "error",
+                "SESSION_NOT_OWNED",
+                "Only the principal that owns a capture may stop it.",
+            )
+            return
+        # Fan-out already notifies subscribers. Ack the requester only when
+        # they would otherwise hear nothing (they were not subscribed).
+        was_subscriber = (
+            (self.clients.get(websocket) or {}).get("subscribed_to") == session_id
+        )
+        await self.stop_streaming(owner_ws, reason="OWNER_STOP")
+        if not was_subscriber:
+            await self.send_event(
+                websocket,
+                "status",
+                "CAPTURE_STOPPED",
+                {
+                    "message": _STOP_MESSAGES["OWNER_STOP"],
+                    "reason": "OWNER_STOP",
+                    "session_id": session_id,
+                },
+            )
 
     def _cancel_deadline(self, client: Dict[str, Any]) -> None:
         """Disarm a bounded capture's timer. Never cancels the current task:
@@ -143,6 +343,7 @@ class ConnectionManager:
         """Unregister a finished capture and notify/detach its subscribers.
         Idempotent: safe to call from both stream teardown and stop paths."""
         self._cancel_deadline(client)
+        self._cancel_orphan(client)
         session_id = client.get("session_id")
         client["session_id"] = None
         client["session_config"] = None
@@ -195,13 +396,17 @@ class ConnectionManager:
             "namespace": owner_client.get("namespace"),
             "config": owner_client.get("session_config"),
             **self._lifetime_fields(owner_client),
+            "owner_attached": owner_client.get("owner_attached", True),
+            "subscriber_count": len(owner_client.get("subscribers", ())),
         }
 
     async def subscribe(self, websocket: WebSocket, session_id: Optional[str]) -> None:
         """Attach this socket as a read-only listener on a running capture.
 
-        Any authenticated principal on the device may listen; only the owning
-        socket can configure or stop the capture (control is not shareable).
+        Any authenticated principal on the device may listen. Configure is
+        only the attached owner's socket; stop is that socket or any socket
+        of the same did (by session_id). A detached session is listen/stop
+        only — there is no way to reclaim configure without stopping it.
         """
         client = self.clients.get(websocket)
         if client is None:
@@ -222,6 +427,7 @@ class ConnectionManager:
         self._detach_subscriber(websocket)
         owner_client = self.clients[owner_ws]
         owner_client["subscribers"].add(websocket)
+        self._cancel_orphan(owner_client)
         client["subscribed_to"] = session_id
         await self.send_event(
             websocket, "status", "SUBSCRIBED",
@@ -245,9 +451,16 @@ class ConnectionManager:
     async def _broadcast_chunk(
         self, owner_ws: WebSocket, client: Dict[str, Any], chunk: bytes
     ) -> None:
-        # Owner send failures propagate and end the capture (as before).
-        # A failing subscriber is dropped without disturbing the capture.
-        await owner_ws.send_bytes(chunk)
+        # A failing subscriber is dropped without disturbing the capture. A
+        # failing owner ends a perpetual capture (as before) but only detaches
+        # from a bounded one, which lives on for its listeners.
+        if client.get("owner_attached", True):
+            try:
+                await owner_ws.send_bytes(chunk)
+            except Exception:
+                if not self._is_detachable(client):
+                    raise
+                self._detach_owner(owner_ws, client)
         for subscriber in list(client.get("subscribers", set())):
             try:
                 await subscriber.send_bytes(chunk)
@@ -357,6 +570,9 @@ class ConnectionManager:
         if client is None:
             return
 
+        if await self._reject_control_of_detached(websocket, list(configs)):
+            return
+
         for iface, config in configs.items():
             self.configure(websocket, iface, config)
 
@@ -393,6 +609,12 @@ class ConnectionManager:
 
     async def disconnect(self, websocket: WebSocket) -> None:
         self._detach_subscriber(websocket)
+        client = self.clients.get(websocket)
+        if client and self._is_capturing(client) and self._is_detachable(client):
+            # Bounded: the session outlives this socket. Keep the record; it
+            # is dropped when the session ends.
+            self._detach_owner(websocket, client)
+            return
         try:
             await self.stop_streaming(websocket, reason="OWNER_DISCONNECT")
         except Exception as e:
@@ -402,6 +624,9 @@ class ConnectionManager:
     async def send_event(
         self, websocket: WebSocket, event_type: str, code: str, data: dict
     ) -> None:
+        client = self.clients.get(websocket)
+        if client is not None and not client.get("owner_attached", True):
+            return  # detached owner: there is no socket behind this record
         try:
             await websocket.send_text(
                 json.dumps(
@@ -572,6 +797,8 @@ class ConnectionManager:
 
         conflicts = self._claim_interfaces(websocket, interfaces)
         if conflicts:
+            if await self._reject_control_of_detached(websocket, conflicts):
+                return
             await self.send_message_event(
                 websocket,
                 "error",
@@ -642,12 +869,13 @@ class ConnectionManager:
                     if not chunk:
                         break
                     await self._broadcast_chunk(websocket, client, chunk)
-                await self.send_event(
-                    websocket,
-                    "status",
-                    "CAPTURE_ENDED",
-                    {"message": "Capture ended.", "reason": "PROCESS_EXITED"},
-                )
+                if client.get("owner_attached", True):
+                    await self.send_event(
+                        websocket,
+                        "status",
+                        "CAPTURE_ENDED",
+                        {"message": "Capture ended.", "reason": "PROCESS_EXITED"},
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -680,6 +908,7 @@ class ConnectionManager:
                     client["proc"] = None
                 if client.get("task") is asyncio.current_task():
                     client["task"] = None
+                self._drop_if_detached(websocket, client)
 
         client["proc"] = proc
         client["task"] = asyncio.create_task(stream())
@@ -691,6 +920,7 @@ class ConnectionManager:
         session_id = f"cap_{secrets.token_hex(4)}"
         client["session_id"] = session_id
         client["started_mono"] = self._clock()
+        client["owner_attached"] = True
         client["duration_sec"] = start.duration_sec
         if start.duration_sec is not None:
             # Core keeps the deadline so it holds even if the owner never
@@ -713,11 +943,8 @@ class ConnectionManager:
             "status",
             "CAPTURE_STARTED",
             {
+                **self._session_descriptor(session_id, websocket),
                 "message": f"Started capture on {', '.join(interfaces)}",
-                "session_id": session_id,
-                "interfaces": sorted(interfaces),
-                "config": client["session_config"],
-                **self._lifetime_fields(client),
             },
         )
 
@@ -757,7 +984,7 @@ class ConnectionManager:
         client["task"] = None
         client["proc"] = None
 
-        if notify:
+        if notify and client.get("owner_attached", True):
             try:
                 await self.send_event(
                     websocket,
@@ -767,6 +994,7 @@ class ConnectionManager:
                 )
             except Exception:
                 pass
+        self._drop_if_detached(websocket, client)
 
     async def shutdown_all(self) -> None:
         """Stop every capture and discard all client state during app shutdown."""

@@ -524,6 +524,8 @@ async def run_owner(args) -> None:
         # core end the capture (subscribers see DURATION_ELAPSED). Keep a
         # generous local deadline only as a guard against a wedged server.
         duration_sec = int(round(args.duration)) if args.duration else None
+        if getattr(args, "detach", False) and not duration_sec:
+            raise RuntimeError("--detach requires --duration (only bounded captures outlive the owner)")
         if duration_sec:
             start_cmd["duration_sec"] = max(1, duration_sec)
         await ws.send(json.dumps(start_cmd))
@@ -544,6 +546,9 @@ async def run_owner(args) -> None:
         print(f"  subscribe from another instance:")
         print(f"    capture_harness.py run --subscribe {session_id} "
               f"--url {args.url}")
+        if getattr(args, "detach", False):
+            print(f"  DETACH: Ctrl-C closes without stop; the capture keeps "
+                  f"running until duration_sec / stop {{session_id}} / no listeners")
         print("=" * 60)
 
         raw_fp = open(args.raw_out, "wb") if args.raw_out else None
@@ -555,7 +560,7 @@ async def run_owner(args) -> None:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
-            if not ended:
+            if not ended and not getattr(args, "detach", False):
                 try:
                     await ws.send(json.dumps({"command": "stop"}))
                 except Exception:
@@ -722,6 +727,12 @@ def main() -> None:
 
     pr = sub.add_parser("run", help="start or subscribe to a capture")
     add_client_args(pr)
+    pr.add_argument(
+        "--detach",
+        action="store_true",
+        help="owner: close without sending stop so a bounded capture keeps "
+        "running for subscribers (requires --duration)",
+    )
     g = pr.add_mutually_exclusive_group(required=True)
     g.add_argument("--config", help="config JSON to start a capture (owner)")
     g.add_argument("--subscribe", help="session id to listen to (read-only)")
