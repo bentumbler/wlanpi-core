@@ -118,7 +118,8 @@ class CaptureStart(BaseModel):
     )
     pcap_filter: str = ""
     #: Seconds after which core stops the capture itself. None = perpetual
-    #: (runs until the owner stops it or its socket closes), as before.
+    #: (dies with the owner's socket). A bounded capture may detach when
+    #: that socket closes; it is then listen/stop only.
     duration_sec: Optional[int] = None
 
     model_config = {"extra": "forbid"}

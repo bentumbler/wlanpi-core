@@ -143,6 +143,65 @@ class ConnectionManager:
     def _is_detachable(client: Dict[str, Any]) -> bool:
         return client.get("duration_sec") is not None
 
+    def _detached_holder(
+        self, websocket: WebSocket, interfaces
+    ) -> Optional[Tuple[WebSocket, Dict[str, Any], str]]:
+        """If any named interface is held by a detached session this socket
+        does not own as the attached owner, return that session. Used to
+        refuse configure/start: detach is listen/stop only."""
+        for iface in interfaces:
+            owner_ws = self.interface_owners.get(iface)
+            if owner_ws is None or owner_ws is websocket:
+                continue
+            owner_client = self.clients.get(owner_ws) or {}
+            session_id = owner_client.get("session_id")
+            if session_id and not owner_client.get("owner_attached", True):
+                return owner_ws, owner_client, session_id
+        return None
+
+    async def _reject_control_of_detached(
+        self, websocket: WebSocket, interfaces
+    ) -> bool:
+        """Refuse configure/start on interfaces a detached session holds.
+
+        Returns True after sending CONTROL_NOT_ALLOWED. Regain control only
+        by stopping that session and starting a new capture.
+        """
+        held = self._detached_holder(websocket, interfaces)
+        if held is None:
+            return False
+        _, owner_client, session_id = held
+        requester_did = (self.clients.get(websocket) or {}).get("did")
+        same_owner = (
+            requester_did is not None and requester_did == owner_client.get("did")
+        )
+        allowed = ["subscribe", "list_sessions"]
+        if same_owner:
+            allowed.append("stop")
+            message = (
+                f"Session {session_id} is detached; no control except stop. "
+                "Subscribe to listen, or list_sessions. To change the radio, "
+                f'stop it with {{"command": "stop", "session_id": "{session_id}"}} '
+                "and start a new capture."
+            )
+        else:
+            message = (
+                f"Session {session_id} is detached; only its owner may stop it. "
+                "Subscribe to listen, or list_sessions."
+            )
+        await self.send_event(
+            websocket,
+            "error",
+            "CONTROL_NOT_ALLOWED",
+            {
+                "message": message,
+                "session_id": session_id,
+                "owner_attached": False,
+                "allowed": allowed,
+            },
+        )
+        return True
+
     def _detach_owner(self, owner_ws: WebSocket, client: Dict[str, Any]) -> None:
         client["owner_attached"] = False
         self._arm_orphan_if_unattended(owner_ws, client)
@@ -210,17 +269,23 @@ class ConnectionManager:
                 "Only the principal that owns a capture may stop it.",
             )
             return
-        await self.stop_streaming(owner_ws, reason="OWNER_STOP")
-        await self.send_event(
-            websocket,
-            "status",
-            "CAPTURE_STOPPED",
-            {
-                "message": _STOP_MESSAGES["OWNER_STOP"],
-                "reason": "OWNER_STOP",
-                "session_id": session_id,
-            },
+        # Fan-out already notifies subscribers. Ack the requester only when
+        # they would otherwise hear nothing (they were not subscribed).
+        was_subscriber = (
+            (self.clients.get(websocket) or {}).get("subscribed_to") == session_id
         )
+        await self.stop_streaming(owner_ws, reason="OWNER_STOP")
+        if not was_subscriber:
+            await self.send_event(
+                websocket,
+                "status",
+                "CAPTURE_STOPPED",
+                {
+                    "message": _STOP_MESSAGES["OWNER_STOP"],
+                    "reason": "OWNER_STOP",
+                    "session_id": session_id,
+                },
+            )
 
     def _cancel_deadline(self, client: Dict[str, Any]) -> None:
         """Disarm a bounded capture's timer. Never cancels the current task:
@@ -304,8 +369,10 @@ class ConnectionManager:
     async def subscribe(self, websocket: WebSocket, session_id: Optional[str]) -> None:
         """Attach this socket as a read-only listener on a running capture.
 
-        Any authenticated principal on the device may listen; only the owning
-        socket can configure or stop the capture (control is not shareable).
+        Any authenticated principal on the device may listen. Configure is
+        only the attached owner's socket; stop is that socket or any socket
+        of the same did (by session_id). A detached session is listen/stop
+        only — there is no way to reclaim configure without stopping it.
         """
         client = self.clients.get(websocket)
         if client is None:
@@ -467,6 +534,9 @@ class ConnectionManager:
         """
         client = self.clients.get(websocket)
         if client is None:
+            return
+
+        if await self._reject_control_of_detached(websocket, list(configs)):
             return
 
         for iface, config in configs.items():
@@ -693,6 +763,8 @@ class ConnectionManager:
 
         conflicts = self._claim_interfaces(websocket, interfaces)
         if conflicts:
+            if await self._reject_control_of_detached(websocket, conflicts):
+                return
             await self.send_message_event(
                 websocket,
                 "error",
@@ -837,11 +909,8 @@ class ConnectionManager:
             "status",
             "CAPTURE_STARTED",
             {
+                **self._session_descriptor(session_id, websocket),
                 "message": f"Started capture on {', '.join(interfaces)}",
-                "session_id": session_id,
-                "interfaces": sorted(interfaces),
-                "config": client["session_config"],
-                **self._lifetime_fields(client),
             },
         )
 

@@ -70,6 +70,16 @@ core as `duration_sec`, so core ends the capture itself when the time is up and
 every subscriber sees `CAPTURE_STOPPED` with reason `DURATION_ELAPSED`; without
 it the capture is perpetual and runs until Ctrl-C.
 
+Owner `--detach` (requires `--duration`) closes the socket **without** `stop`,
+so a subscriber can keep the stream. Ctrl-C without `--detach` still stops.
+
+```bash
+./capture_harness.py run --config lab.json --duration 60 --detach
+```
+
+A reconnecting owner should `list` first; `configure`/`start` on that interface
+are refused until they `stop` the detached session.
+
 ### 3. Subscribe (read-only, second instance)
 
 You do **not** need the owner's capture command or config to attach — only a

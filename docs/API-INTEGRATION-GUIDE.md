@@ -400,12 +400,13 @@ An invalid/expired token, a non-auth first message, or a timeout closes 4401.
 
 `width` ∈ {20,40,80,160}; `dwell_time` 50–60000 ms. Interface names are the
 monitor VIFs (`wlanpiN`); core runs the capture in whatever namespace the
-adapter lives in. `start` replies `CAPTURE_STARTED` with a `session_id`
-(`cap_xxxx`), the `interfaces`, the `namespace`, the running `config`, and the
-lifetime fields (`elapsed_sec`, `duration_sec`, `remaining_sec`).
-Then binary pcapng frames stream until `{ "command": "stop" }`, the socket
-closes, or the capture ends (`CAPTURE_ENDED`). Only the owning connection can
-`configure`/`stop`.
+adapter lives in. `start` replies `CAPTURE_STARTED` with the same session
+descriptor as `list_sessions` / `SUBSCRIBED` (`session_id`, `owner`,
+`interfaces`, `namespace`, `config`, lifetime fields, `owner_attached`,
+`subscriber_count`) plus a `message`. Then binary pcapng frames stream until
+`stop`, the capture ends, or — for a **perpetual** capture — the owner socket
+closes. While the owner socket is attached, only that connection can
+`configure`. `stop` without `session_id` stops this socket's own capture.
 
 **Bounded capture.** Add `"duration_sec": 300` (1–3600) to `start` and core
 stops the capture itself when the time is up — no client-side sleep-then-stop,
@@ -413,7 +414,8 @@ and every subscriber can see the plan in `duration_sec`/`remaining_sec`. Omit
 it and the capture is perpetual, exactly as before. Every end says why:
 `CAPTURE_STOPPED` carries `data.reason` = `OWNER_STOP`, `OWNER_DISCONNECT` or
 `DURATION_ELAPSED`; `CAPTURE_ENDED` (dumpcap exited) carries `PROCESS_EXITED`.
-The duration cannot be changed on a running capture.
+The duration cannot be changed on a running capture. See 11.5 for what happens
+when a bounded owner disconnects.
 
 ### 11.3 Retune mid-capture
 
@@ -495,10 +497,17 @@ grace window and the capture runs to its deadline. A capture with no listeners
 is not kept alive — the radio would be hopping into nowhere. Another
 connection with a different `did` asking to stop it gets `SESSION_NOT_OWNED`.
 
+Detach is **listen/stop only**. There is no way to reclaim `configure` on a
+detached session. A reconnecting owner should `list_sessions`: if the session
+is still there, subscribe to listen or `stop` with its `session_id`. Any
+`configure` or `start` that names an interface that session holds is
+`CONTROL_NOT_ALLOWED` (payload includes `session_id`, `owner_attached: false`,
+and `allowed`). The only way to change the radio is to stop that session and
+start a new capture.
+
 While a detached capture holds an interface, a new `start` on that interface
-fails with `INTERFACE_IN_USE` as usual; stop the old session by `session_id`
-first (or subscribe to it instead — a reconnected owner may subscribe to its
-own detached session).
+fails that way; a competing `start` on an **attached** capture still fails
+with `INTERFACE_IN_USE` as before.
 
 ### 11.6 Other commands & events
 
@@ -507,8 +516,11 @@ list per capture adapter). Event shape:
 
 ```json
 { "type": "event", "event": "status", "code": "CAPTURE_STARTED",
-  "data": { "session_id": "cap_ab12", "interfaces": ["wlanpi0"],
-            "namespace": null, "config": { … } } }
+  "data": { "session_id": "cap_ab12", "owner": "p61", "interfaces": ["wlanpi0"],
+            "namespace": null, "config": { … }, "elapsed_sec": 0,
+            "duration_sec": 300, "remaining_sec": 300,
+            "owner_attached": true, "subscriber_count": 0,
+            "message": "Started capture on wlanpi0" } }
 ```
 
 Notable codes: `AUTH_OK`, `AUTH_FAILED`, `CAPTURE_STARTED`, `CHANNEL_SET` /
@@ -517,8 +529,9 @@ on single-radio devices the phy can be briefly busy while the managed interface
 scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
 (sent to subscribers after a live retune), `CAPTURE_STOPPED` /
 `CAPTURE_ENDED` (with `data.reason`, see 11.2 and 11.5), and errors
-`INTERFACE_IN_USE`, `INTERFACE_NOT_AVAILABLE`, `SESSION_NOT_FOUND`,
-`SESSION_NOT_OWNED`, `CONFIG_INVALID`,
+`INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED` (configure/start on an interface a
+detached session holds — listen or stop only), `INTERFACE_NOT_AVAILABLE`,
+`SESSION_NOT_FOUND`, `SESSION_NOT_OWNED`, `CONFIG_INVALID`,
 `CAPTURE_CONFIG_INVALID` (bad `start`, e.g. `duration_sec` out of range),
 `UNKNOWN_COMMAND`.
 

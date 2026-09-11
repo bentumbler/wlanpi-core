@@ -58,6 +58,8 @@ def _connected_client(manager, websocket):
         "duration_sec": None,
         "deadline_task": None,
         "stop_reason": None,
+        "owner_attached": True,
+        "orphan_task": None,
     }
 
 
@@ -565,6 +567,11 @@ async def test_capture_started_and_descriptor_report_elapsed_from_manager_clock(
     assert started.args[3]["elapsed_sec"] == 0
     assert started.args[3]["duration_sec"] is None
     assert started.args[3]["remaining_sec"] is None
+    assert started.args[3]["owner_attached"] is True
+    assert started.args[3]["subscriber_count"] == 0
+    assert started.args[3]["namespace"] is None
+    assert "wlanpi0" in started.args[3]["interfaces"]
+    assert started.args[3]["session_id"] == session_id
 
     clock.now = 1030.7
     descriptor = manager._session_descriptor(session_id, owner)
@@ -1061,3 +1068,97 @@ async def test_owner_send_failure_detaches_bounded_but_ends_perpetual(mocker):
     with pytest.raises(RuntimeError):
         await manager._broadcast_chunk(perpetual, manager.clients[perpetual], b"x")
     await manager.stop_streaming(perpetual, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_detached_session_refuses_configure_and_start(mocker):
+    """Detach is listen/stop only. configure/start on a held iface is
+    CONTROL_NOT_ALLOWED and must not store a deferred config."""
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    reconnector = _Sock()
+    _connected_client(manager, reconnector)
+    manager.clients[reconnector]["did"] = "owner-did"
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        reconnector,
+        _configs(wlanpi0={"channels": [{"freq": 5180, "width": 20}]}),
+    )
+    (denied,) = _events(send_event, "CONTROL_NOT_ALLOWED")
+    assert denied.args[3]["session_id"] == session_id
+    assert denied.args[3]["owner_attached"] is False
+    assert "stop" in denied.args[3]["allowed"]
+    assert manager.clients[reconnector]["configs"] == {}
+    assert process.terminated is False
+
+    send_event.reset_mock()
+    manager.configure(
+        reconnector, "wlanpi0", {"channels": [{"freq": 5180, "width": 20}]}
+    )
+    await manager.start_streaming(reconnector, ["wlanpi0"], "")
+    (denied_start,) = _events(send_event, "CONTROL_NOT_ALLOWED")
+    assert denied_start.args[3]["session_id"] == session_id
+    assert manager.sessions == {session_id: owner}
+
+    send_event.reset_mock()
+    await manager.apply_configuration(
+        reconnector,
+        _configs(wlanpi1={"channels": [{"freq": 2412, "width": 20}]}),
+    )
+    (applied,) = _events(send_event, "CONFIG_APPLIED")
+    assert applied.args[3]["deferred"] == ["wlanpi1"]
+    assert applied.args[3]["applied_live"] == []
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_stranger_configure_on_detached_iface_is_also_refused(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+    owner, _, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    stranger = _Sock()
+    _connected_client(manager, stranger)
+    manager.clients[stranger]["did"] = "someone-else"
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        stranger,
+        _configs(wlanpi0={"channels": [{"freq": 2412, "width": 20}]}),
+    )
+    (denied,) = _events(send_event, "CONTROL_NOT_ALLOWED")
+    assert denied.args[3]["session_id"] == session_id
+    assert "stop" not in denied.args[3]["allowed"]
+    assert manager.clients[stranger]["configs"] == {}
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_stop_by_session_id_from_a_subscriber_is_not_duplicated(mocker):
+    """Best practice: one CAPTURE_STOPPED per socket. A same-did stopper who
+    is already subscribed hears the fan-out, not a second ack."""
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    manager.clients[subscriber]["did"] = "owner-did"
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.stop_session(subscriber, session_id)
+
+    assert process.terminated is True
+    stopped = _events(send_event, "CAPTURE_STOPPED")
+    assert [call.args[0] for call in stopped] == [subscriber]
+    assert stopped[0].args[3]["reason"] == "OWNER_STOP"
+
