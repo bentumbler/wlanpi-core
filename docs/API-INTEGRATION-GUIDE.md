@@ -406,7 +406,9 @@ descriptor as `list_sessions` / `SUBSCRIBED` (`session_id`, `owner`,
 `subscriber_count`) plus a `message`. Then binary pcapng frames stream until
 `stop`, the capture ends, or — for a **perpetual** capture — the owner socket
 closes. While the owner socket is attached, only that connection can
-`configure`. `stop` without `session_id` stops this socket's own capture.
+`configure`. `stop` without `session_id` stops this socket's **attached**
+capture only. After reconnect, a bare `stop` is `STOP_REQUIRES_SESSION`;
+use `{"command": "stop", "session_id": "cap_…"}`.
 
 **Bounded capture.** Add `"duration_sec": 300` (1–3600) to `start` and core
 stops the capture itself when the time is up — no client-side sleep-then-stop,
@@ -499,8 +501,10 @@ connection with a different `did` asking to stop it gets `SESSION_NOT_OWNED`.
 
 Detach is **listen/stop only**. There is no way to reclaim `configure` on a
 detached session. A reconnecting owner should `list_sessions`: if the session
-is still there, subscribe to listen or `stop` with its `session_id`. Any
-`configure` or `start` that names an interface that session holds is
+is still there, subscribe to listen or `stop` with its `session_id`. A bare
+`{"command": "stop"}` on that new connection is `STOP_REQUIRES_SESSION`
+(`data.sessions` lists the ids to use) and does **not** end the capture.
+Any `configure` or `start` that names an interface that session holds is
 `CONTROL_NOT_ALLOWED` (payload includes `session_id`, `owner_attached: false`,
 and `allowed`). The only way to change the radio is to stop that session and
 start a new capture.
@@ -531,7 +535,9 @@ scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHAN
 `CAPTURE_ENDED` (with `data.reason`, see 11.2 and 11.5), and errors
 `INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED` (configure/start on an interface a
 detached session holds — listen or stop only), `INTERFACE_NOT_AVAILABLE`,
-`SESSION_NOT_FOUND`, `SESSION_NOT_OWNED`, `CONFIG_INVALID`,
+`SESSION_NOT_FOUND`, `SESSION_NOT_OWNED`, `STOP_REQUIRES_SESSION` (bare `stop`
+on a socket with no attached capture; `data.sessions` lists ids this `did`
+owns), `CONFIG_INVALID`,
 `CAPTURE_CONFIG_INVALID` (bad `start`, e.g. `duration_sec` out of range),
 `UNKNOWN_COMMAND`.
 

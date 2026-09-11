@@ -59,7 +59,8 @@ Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
   (`data.sessions`), `CAPTURE_STOPPED` / `CAPTURE_ENDED` (`data.reason` ∈
   `OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`, `NO_LISTENERS`,
   `PROCESS_EXITED`), and `error` events
-  (`AUTH_FAILED`, `INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED`, `SESSION_NOT_FOUND`,
+  (`AUTH_FAILED`, `INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED`,
+  `STOP_REQUIRES_SESSION`, `SESSION_NOT_FOUND`,
   `CONFIG_INVALID`, …).
 
 ---
@@ -73,7 +74,8 @@ Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
   connection may `subscribe` read-only (device-open reads — see Appendix A
   policy A). A detached session cannot be retuned; stop it and start a new
   capture to change the radio. `configure`/`start` on an interface it holds
-  is `CONTROL_NOT_ALLOWED`. Reconnect with `list_sessions` to see it.
+  is `CONTROL_NOT_ALLOWED`. Reconnect with `list_sessions` to see it. Bare
+  `stop` on a new connection is `STOP_REQUIRES_SESSION`; use `session_id`.
 - **A perpetual capture lives with its owning socket.** If the socket closes,
   the capture stops and subscribers are detached (`OWNER_DISCONNECT`).
 - **A bounded capture (`duration_sec`) lives with its `did`.** If the owner's

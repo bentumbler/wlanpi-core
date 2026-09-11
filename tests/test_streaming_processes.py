@@ -1162,3 +1162,63 @@ async def test_stop_by_session_id_from_a_subscriber_is_not_duplicated(mocker):
     assert [call.args[0] for call in stopped] == [subscriber]
     assert stopped[0].args[3]["reason"] == "OWNER_STOP"
 
+
+@pytest.mark.asyncio
+async def test_bare_stop_on_attached_owner_still_stops(mocker):
+    manager = ConnectionManager()
+    owner = object()
+    _connected_client(manager, owner)
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}]
+    )
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.stop_session(owner, None)
+
+    assert process.terminated is True
+    assert manager.sessions == {}
+    (stopped,) = _events(send_event, "CAPTURE_STOPPED")
+    assert stopped.args[3]["reason"] == "OWNER_STOP"
+
+
+@pytest.mark.asyncio
+async def test_bare_stop_after_detach_requires_session_id(mocker):
+    """A reconnecting owner who sends stop with no id must not get a fake
+    CAPTURE_STOPPED; the detached capture keeps running."""
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    subscriber = _Sock()
+    owner, process, session_id = await _detached_capture(
+        manager, mocker, subscriber=subscriber
+    )
+    reconnector = _Sock()
+    _connected_client(manager, reconnector)
+    manager.clients[reconnector]["did"] = "owner-did"
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.stop_session(reconnector, None)
+
+    assert process.terminated is False
+    assert manager.sessions == {session_id: owner}
+    assert _events(send_event, "CAPTURE_STOPPED") == []
+    (err,) = _events(send_event, "STOP_REQUIRES_SESSION")
+    assert err.args[3]["sessions"] == [session_id]
+    assert session_id in err.args[3]["message"]
+
+    await manager.stop_streaming(owner, notify=False)
+
+
+@pytest.mark.asyncio
+async def test_bare_stop_with_nothing_running_is_an_error(mocker):
+    manager = ConnectionManager()
+    idle = object()
+    _connected_client(manager, idle)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.stop_session(idle, None)
+
+    (err,) = _events(send_event, "STOP_REQUIRES_SESSION")
+    assert err.args[3]["sessions"] == []
+    assert _events(send_event, "CAPTURE_STOPPED") == []
+
+

@@ -108,7 +108,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     | `get_supported_frequencies` | `{}` | Returns supported channel list |
     | `configure` | `{ "interfaces": { "wlanpi0": {…} } }` | Per-interface capture config |
     | `start` | `{ "interfaces": ["wlanpi0"], "pcap_filter": "…", "duration_sec": 300 }` | Begin streaming (`duration_sec` optional) |
-    | `stop` | `{}` or `{ "session_id": "cap_…" }` | Stop own capture, or a session owned by this principal (`did`) |
+    | `stop` | `{}` or `{ "session_id": "cap_…" }` | Bare `stop` ends this socket's **attached** capture only. After detach, `session_id` is required (`STOP_REQUIRES_SESSION` otherwise). |
 
     **Bounded captures:** `duration_sec` (1–3600) makes core stop the capture
     itself when the time is up; omit it for a perpetual capture that runs until
@@ -124,7 +124,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     short grace period (`NO_LISTENERS`). A perpetual capture still stops the
     moment its owner's socket closes. Detach is **listen/stop only**:
     `configure` or `start` on an interface the detached session holds is
-    `CONTROL_NOT_ALLOWED`. Reconnect, `list_sessions`, then subscribe or stop.
+    `CONTROL_NOT_ALLOWED`. Bare `{"command": "stop"}` on a reconnect is
+    `STOP_REQUIRES_SESSION` (payload lists that principal's session ids).
+    Reconnect, `list_sessions`, then subscribe or stop with `session_id`.
     The only way to regain radio control is to stop that session and start a
     new capture.
 

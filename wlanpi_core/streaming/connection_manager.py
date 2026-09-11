@@ -240,12 +240,46 @@ class ConnectionManager:
     async def stop_session(
         self, websocket: WebSocket, session_id: Optional[str]
     ) -> None:
-        """`stop`: without a session_id, stop this socket's own capture (as
-        before). With one, stop that session - allowed for the owning socket
-        and for any socket authenticated as the owner's did, which is how a
-        detached capture is stopped early from a new connection."""
+        """`stop`: without a session_id, stop this socket's attached capture.
+        A reconnecting socket is not the attached owner, so a bare stop is
+        `STOP_REQUIRES_SESSION` (never a fake CAPTURE_STOPPED). With a
+        session_id, stop that session if this socket owns it or shares the
+        owner's did.
+        """
         if session_id is None:
-            await self.stop_streaming(websocket)
+            client = self.clients.get(websocket)
+            if (
+                client
+                and self._is_capturing(client)
+                and client.get("owner_attached", True)
+            ):
+                await self.stop_streaming(websocket)
+                return
+            did = (client or {}).get("did")
+            owned = sorted(
+                sid
+                for sid, owner_ws in self.sessions.items()
+                if did
+                and (self.clients.get(owner_ws) or {}).get("did") == did
+            )
+            if len(owned) == 1:
+                message = (
+                    "This connection has no attached capture. Stop a detached "
+                    f'session with {{"command": "stop", "session_id": "{owned[0]}"}}.'
+                )
+            elif owned:
+                message = (
+                    "This connection has no attached capture. Stop a session "
+                    'with {"command": "stop", "session_id": "<id>"}.'
+                )
+            else:
+                message = "This connection has no attached capture to stop."
+            await self.send_event(
+                websocket,
+                "error",
+                "STOP_REQUIRES_SESSION",
+                {"message": message, "sessions": owned},
+            )
             return
         owner_ws = self.sessions.get(session_id)
         if owner_ws is None:
