@@ -230,8 +230,14 @@ itself; do not block the log work on this.
 
 ## 6. The use case, end to end, with the pieces above
 
-Orchestration lives in **wlanpi-mcp**, not core. Core provides primitives;
-MCP sequences them.
+> **Superseded 2026-09-15.** The sequencing below is now the *manual fallback*.
+> The orchestrated version lives in core as the generic connection trace
+> resource (`/wifi/trace/*`: one station, N capture adapters, file-backed
+> captures, artifact download, merged summary; MLO is the N > 1 case):
+> see [`connection-trace-plan.md`](./connection-trace-plan.md) D1/D2. S1–S3
+> remain prerequisites; S4 is absorbed by M1 (`GET /wifi/trace/adapters`).
+
+Core provides primitives; the steps below sequence them by hand.
 
 1. **Scan.** `GET /utils/wlan/scan?detail=full` on any managed adapter.
    Group rows for the target SSID by `mld.addr` (§4) → the set of links
@@ -284,7 +290,8 @@ sharing the station's phy must not be used as a capture adapter.
 | S2 | `feature/supplicant-log-api` | Four GET routes + DELETE; `parse_events()` with fixture log (recorded on the box from a real MLO association, secrets scrubbed); OpenAPI docstrings; `docs/` consumer notes | S1 |
 | S3 | `feature/scan-mld-fields` | `mld` + `band` in scan parser (§4) with `iw` fixture | — |
 | S4 | `feature/wifi-capabilities-eht` | parsed `eht` flag per phy (§5) | — |
-| M1 | wlanpi-mcp | `connect_and_trace_mlo` tool implementing §6 against S1–S4 and the capture handover | S1–S4 |
+| M1–M8 | wlanpi-core | connection trace resource: inventory, targets, planner, file sink, orchestrator, artifacts, summary, docs — see [`connection-trace-plan.md`](./connection-trace-plan.md) §13 (M1 absorbs S4) | S1–S3 |
+| MCP | wlanpi-mcp | tools wrapping the trace resource — [`connection-trace-mcp-blueprint.md`](./connection-trace-mcp-blueprint.md) | M1–M7 |
 
 S1 is the one that touches the activation path and is the one to get right;
 S2 is pure read-side. S3/S4 are independent and can go in any order. Debian

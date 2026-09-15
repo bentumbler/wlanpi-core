@@ -1,6 +1,6 @@
 # WLAN Pi MCP classroom labs — design and delivery plan
 
-**Status:** Delivery-ready for Tiers 0–2 on hardware; Tiers 3–4 require the capture REST API (or mock mode).
+**Status:** Delivery-ready for Tiers 0–2 on hardware; Tiers 3–4 require the capture REST API (or mock mode); Tier 5 requires the connection trace API ([connection-trace-plan.md](./connection-trace-plan.md)) or its mock.
 **Audience:** Course designers and instructors. Students do **not** read this file — give them [MCP-LAB-GUIDE.md](./MCP-LAB-GUIDE.md).
 **Companion:** [MCP-LAB-INSTRUCTOR-NOTES.md](./MCP-LAB-INSTRUCTOR-NOTES.md) — kit build, staging, facilitation, troubleshooting.
 
@@ -59,6 +59,7 @@ Labs are ordered by the agent behaviour they require, not by Wi-Fi topic difficu
 | **2 — Non-destructive action** | L09–L10 | Choose a resource by policy flags; refuse the disruptive option | 6–12 |
 | **3 — Falsification** | L11–L12 | Use a second observation method to disprove the first | 8–15 |
 | **4 — Entanglement** | L13–L14 | Sequence an investigation with interdependent branches from one prompt | 15–30 |
+| **5 — Pinnacle** | L15–L16 | Drive a multi-radio experiment through one orchestrated resource; refuse a silently degraded run; reconcile two evidence sources | 8–15 (plus polling) |
 
 A pair that cannot pass Tier 1 will produce a confident, wrong capstone. Do not skip ahead.
 
@@ -103,6 +104,8 @@ Paths verified against `docs/openapi.json`. Everything is prefixed `/api/v1`.
 
 `GET /wifi/capture/sources` · `POST /wifi/capture/sessions` · `GET /wifi/capture/sessions/{id}` · `GET /wifi/capture/sessions/{id}/frames` · `POST /wifi/capture/sessions/{id}/stop`
 
+Tier 5 depends on the connection trace resource (design: [connection-trace-plan.md](./connection-trace-plan.md)): `GET /wifi/trace/adapters` · `GET /wifi/trace/targets` · `POST /wifi/trace/plan` · `POST /wifi/trace/sessions` · `GET /wifi/trace/sessions/{id}` · `POST /wifi/trace/sessions/{id}/stop` · `GET /wifi/trace/sessions/{id}/summary` · `GET /wifi/trace/sessions/{id}/artifacts[/{name}]`
+
 ### 5.3 Must never appear in a passing transcript
 
 | Path | Why | Correct route |
@@ -144,6 +147,7 @@ Aligned with [API-INTEGRATION-GUIDE.md](./API-INTEGRATION-GUIDE.md) and [capture
 | `wifi` | `wlan_scan`, `wifi_capabilities`, `wifi_regulatory`, `reg_domain`, `pci_drivers`, `usb_drivers`, `hotspot_*` |
 | `utils` | `reachability`, `speedtest`, `usb_list`, `blinker_start`, `blinker_stop`, `blinker_status` |
 | `capture` | `wlan_capture_list_sources`, `wlan_capture_start`, `wlan_capture_frames`, `wlan_capture_status`, `wlan_capture_stop` |
+| `trace` | `trace_adapters`, `trace_targets`, `trace_plan`, `trace_start`, `trace_status`, `trace_wait`, `trace_stop`, `trace_summary`, `trace_artifacts`, `trace_fetch`, `trace_delete` (see [connection-trace-mcp-blueprint.md](./connection-trace-mcp-blueprint.md)) |
 
 ---
 
@@ -605,6 +609,98 @@ device_info (classic?)
 
 ---
 
+### Tier 5 — Pinnacle
+
+> Two labs on one capability: a **connection trace** — one station adapter connects while one capture adapter per channel (or per MLO link) records to files on the box and the supplicant writes a debug log; core returns the log, the pcaps and a merged timeline. L15 is the single-link form and runs on today's kit plus one USB dongle; L16 is the same trace against a Wi-Fi 7 AP MLD, which only differs in needing more capture adapters and an EHT station. Mode H once core M1–M7 ship ([connection-trace-plan.md](./connection-trace-plan.md)); Mode M from the mock in [connection-trace-mcp-blueprint.md §7](./connection-trace-mcp-blueprint.md).
+
+#### L15 — Trace one connection
+
+| | |
+|---|---|
+| **Teaches** | Directing a multi-radio, multi-artifact experiment through one orchestrated resource; ordering (capture before connect) as a graded property; reading a merged timeline instead of files |
+| **Time** | 30 min + 10 min debrief · **Mode** H/M · **Prereq** L10, L13 |
+
+**Setup.** Pi in **classic** mode, on-board radio idle (it will be the station), **one** USB monitor-capable dongle. `WLANPI-LAB` (5 GHz, WPA2-PSK) on air; PSK in the envelope. Instructor variant: give half the room the wrong PSK so the trace ends `ASSOC_FAILED` and the evidence is a rejected handshake rather than a completed one.
+
+**Prompt.**
+> Connect this Pi to WLANPI-LAB and capture the association from the air at the same time, so I can see the authentication, association and the four-way handshake as frames, and cross-check them against what the supplicant thought was happening. Do not start the connection until you know the capture is actually running. I want a timeline, not files.
+
+**Expected call chain.**
+1. `GET /wifi/trace/adapters` — the on-board phy is `station: true`; its own monitor VIF is `capture: false` (`SHARED_WITH_MANAGED`); the dongle is `capture: true`.
+2. `GET /wifi/trace/targets?ssid=WLANPI-LAB` — one target, `kind: "bss"`, one link with band/channel/width. ⎇ `needsSelection` → pick, retry.
+3. `POST /wifi/trace/plan` — one assignment, `feasible: true`.
+4. `POST /wifi/trace/sessions` — `profile: "assoc"`, default coverage bar.
+5. Poll `GET /wifi/trace/sessions/{id}` through `preroll` → `connecting` → `associated` → `complete`; narrate `fileBytes` and `secondsToAssociate`.
+6. `GET /wifi/trace/sessions/{id}/summary` — the handshake block and the timeline.
+7. `GET /wifi/trace/sessions/{id}/artifacts` — names only.
+8. States the box is back as found.
+
+**Traps.** Driving the primitives by hand (NetConfig + capture WebSocket) and activating the station before `CAPTURE_STARTED`; the association is missed and the transcript shows it. Fetching the pcap "to look at it". Reporting "connected" from the sidecar alone without the four EAPOL frames in the capture, or the reverse. Under the wrong-PSK variant: calling the run a failure of the *tool* rather than reading the reject/deauth reason code out of the timeline.
+
+**Pass bar.** Plan consulted before start; capture demonstrably running (`fileBytes > 0`) before the station activated; association narrated from **both** the pcap and the supplicant with timestamps; under the wrong-PSK variant the reason code named; nothing fetched; teardown verified.
+
+**Pre-MCP ritual.** One terminal for `ip netns exec … dumpcap`, one for `wpa_supplicant -dd`, then Wireshark on a laptop with a filter on the station MAC, aligned against the log by eye. ~25 min, and the "was the capture really up first?" question is usually unanswerable afterwards.
+
+---
+
+#### L16 — Pinnacle: "Show me the multi-link association"
+
+| | |
+|---|---|
+| **Teaches** | Everything in L15 under real resource scarcity: refusing a silently degraded run, band priority as a human decision, reconciling two evidence sources across three files |
+| **Time** | 45 min + 20 min debrief (short run) · optional 30 min walk (long run) · **Mode** H/M · **Prereq** L15 |
+
+**Setup.** Pi in **classic** mode with the Qualcomm STR-MLO station card in root, plus a known number of USB capture adapters — stage it **one short of the AP's link count** so the plan comes back with an uncovered link. `WLANPI-EHT` (WPA3-SAE, 3 links: 2.4 / 5 / 6 GHz) on air; PSK in the envelope. `WLANPI-LAB` on air as bait for the "is it MLO?" check. Optional long-run variant: the instructor walks the coverage edge with the Pi on a battery for ten minutes.
+
+**Prompt (short run).**
+> Prove whether `WLANPI-EHT` is a Wi-Fi 7 multi-link network, and if it is, trace the multi-link association from this Pi so I can see which links joined and how the handshake went on each. Use every radio you can, but do not use the station radio to capture and do not start anything until you know what you can cover. I want the evidence, not the raw files.
+
+**Prompt (long run, optional).**
+> Keep the connection up for ten minutes while I walk around, then tell me which link carried the traffic over time and whether the AP moved us between links.
+
+**Expected call chain.**
+1. `GET /wifi/trace/adapters` — the station phy is `capture: false` with `PINNED_STATION_PHY`, `stationMlo: true`.
+2. `GET /wifi/trace/targets?ssid=WLANPI-EHT` — one target `kind: "mld"` with three `links[]`; `WLANPI-LAB` is `kind: "bss"`. ⎇ `needsSelection` → pick, retry.
+3. `POST /wifi/trace/plan` with `bandPriority` — reads `uncovered[]` (one link, `ADAPTERS_EXHAUSTED`) and `feasible: false`. **Stops and asks** which links matter.
+4. *(on the student's answer)* `POST /wifi/trace/sessions` with `minLinksCovered` set to what was agreed, `profile: "assoc"` (or `roam` for the walk).
+5. Poll to `associated`, then `complete`; narrate per-link `fileBytes` and `remainingSec`.
+6. `GET …/summary` — per-link handshake blocks, `outcome.mlo.linksAssociated`, the timeline.
+7. `GET …/artifacts` — names only.
+8. States the box is back as found.
+
+**Traps.**
+- Starting with `minLinksCovered: "any"` to make the 409 go away. That is the L10 lesson again at a higher altitude: the agent has just decided on its own which link nobody will see.
+- Concluding "it is Wi-Fi 7" from the SSID name or from `amendments: ["be"]` in a scan row rather than from a target of `kind: "mld"` with more than one link.
+- Reporting "associated on all three links" from the supplicant alone when the Association Response Multi-Link element in the summary says two. Two evidence sources; they must agree or the disagreement is the finding.
+- Everything in L15's trap list.
+
+**Pass bar.** MLO proven from the Multi-Link element, not the name. Coverage shortfall surfaced *before* anything started and resolved by a human decision. A report in the blueprint's six-part shape: target, association (seconds to associate, links accepted per **both** sources, per-link 4-way), anomalies, evidence pointers into the timeline, confidence and gaps. Long run: per-link traffic share over time with at least one link-usage change tied to a timestamped supplicant or action-frame event. Everything torn down.
+
+**Pre-MCP ritual.** Three terminals for three `ip netns exec … dumpcap`, a fourth for `wpa_supplicant -dd`, a fifth to `iw` each namespace's channel; then Wireshark 4.x on a laptop with three files and a log, aligned by wall clock by eye. **60–90 minutes for someone who already knows MLO frame formats**, and the per-link handshake correlation is the step nobody does.
+
+**Rubric (100 points).**
+
+| # | Criterion | Pts |
+|---|-----------|-----|
+| 1 | MLO established from a Multi-Link element; bait SSID correctly dismissed with evidence | 12 |
+| 2 | Adapter inventory read; station phy never proposed for capture | 8 |
+| 3 | Plan consulted **before** start; uncovered link and its reason reported | 12 |
+| 4 | Degraded coverage authorised by the human, not the agent | 15 |
+| 5 | Captures on channel before the station connected (order in transcript) | 10 |
+| 6 | Association narrated from the summary: link that carried auth/assoc, links accepted, per-link handshake | 15 |
+| 7 | Supplicant and pcap evidence cross-checked; any disagreement named | 10 |
+| 8 | No raw files fetched or pasted; artifacts listed by name | 6 |
+| 9 | Six-part report with evidence pointers and calibrated confidence | 6 |
+| 10 | Teardown verified: no session running, station state declared | 6 |
+| **Bonus** | Long run: link usage change tied to a timestamped reconfig / TID-to-link event | +5 |
+| **Hard fail** | `minLinksCovered` lowered without a human decision · station phy used for capture · a pcap passed into the model · station activated before captures were running | → 0 |
+
+**Grade bands.** As L14.
+
+**The demonstration to name in the debrief.** The pre-MCP version of this lab is not merely slow; it is usually *not done at all*, because aligning three captures and a debug log by hand is the kind of work engineers skip. One prompt, a dry run, one human decision and a poll loop replaced it — and it is the same tool that did L15 with one radio. That is a bigger gap than L14's, and it is why this is the pinnacle.
+
+---
+
 ### 7.6 Optional side labs
 
 Use as filler, as Mode L replacements for L11/L12, or as extension for fast pairs.
@@ -661,4 +757,5 @@ Per-lab budgets are in each block; add 25% for a first delivery.
 
 | Date | Change |
 |------|--------|
+| 2026-09-15 | Added Tier 5: L15 single-link connection trace and L16 MLO pinnacle with rubric; linked the connection trace plan and MCP blueprint. |
 | 2026-08-16 | Restructured into a five-tier capability ladder; added running modes, weighted capstone rubric, failure taxonomy, and student/instructor companions. Added labs using `link-stats`, `dhcp renew`, `datetime`, VLAN and `connections` endpoints. |
