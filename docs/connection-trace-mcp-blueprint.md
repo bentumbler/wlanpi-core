@@ -4,8 +4,8 @@
 **Prereq reading:** [`connection-trace-plan.md`](./connection-trace-plan.md)
 (the core contract this wraps), [`capture-ws-mcp-handover.md`](./capture-ws-mcp-handover.md)
 §2/§4 (identity and token), [`mcp-auth-plan.md`](./mcp-auth-plan.md).
-**Status:** blueprint, 2026-09-15; the core routes are M1–M7 in the plan
-and are not shipped yet. Build against the OpenAPI once M1 lands; mock the
+**Status:** blueprint, 2026-09-15; the core routes are P6.5 and M1–M7 in
+the plan (§13) and are not shipped yet. Build against the OpenAPI once M1 lands; mock the
 rest from the examples in this file.
 
 A **connection trace** is one station adapter connecting to an SSID while

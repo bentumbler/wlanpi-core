@@ -34,7 +34,7 @@ On-box MCP (stdio, or loopback HTTP) reaches core over `localhost:31415`. That p
 | **P4** `getjwt --export` / `--write-env` | wlanpi-core | So agents/instructors never paste a JWT into config |
 | **P6.2–P6.4** session lifetime: `elapsed_sec` on the descriptor; optional `duration_sec` on `start`; detached bounded captures | wlanpi-core | Stacked on P6.1; scoped in [`capture-ws-lifetime-plan.md`](./capture-ws-lifetime-plan.md) |
 | **S1–S3** supplicant debug-log store and read API; scan MLD fields | wlanpi-core | S1 on `feature/supplicant-log-store`; [`supplicant-log-plan.md`](./supplicant-log-plan.md) |
-| **M1–M8** connection trace: adapter inventory, targets, planner, file-backed captures, orchestrator, artifact download, merged summary, docs (single link, ESS roam, and MLO from one resource) | wlanpi-core | The pinnacle capability; [`connection-trace-plan.md`](./connection-trace-plan.md). MCP side: [`connection-trace-mcp-blueprint.md`](./connection-trace-mcp-blueprint.md) |
+| **P6.5 + M1–M8** connection trace: file sink on the P6 stack, then adapter inventory, targets, planner, orchestrator, artifact download, merged summary, docs (single link, ESS roam, and MLO from one resource) | wlanpi-core | The pinnacle capability; [`connection-trace-plan.md`](./connection-trace-plan.md) §13 names the two bases. MCP side: [`connection-trace-mcp-blueprint.md`](./connection-trace-mcp-blueprint.md) |
 
 When these land, internal MCP capture is production-usable for a single-operator box.
 

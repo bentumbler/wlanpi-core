@@ -8,6 +8,8 @@ link, L16 MLO). The MCP-side contract is
 [`connection-trace-mcp-blueprint.md`](./connection-trace-mcp-blueprint.md).
 
 **Status:** design, 2026-09-15. Nothing here is implemented.
+**Branch:** this document lives on `docs/connection-trace-plan`; the first
+code PR is **P6.5** (`feature/capture-file-sink-p65`), see §13.
 **Decides:** where orchestration lives (core), file-vs-stream (file), the
 adapter assignment rule, the error contract, the PR stack.
 
@@ -74,9 +76,9 @@ capture.
 |---|---|---|
 | Find the target and its links | `GET /utils/wlan/scan?detail=full` returns freq/width/`amendments`; no MLD grouping, no `band` | **S3** (`mld`, `band` on scan rows); `GET /wifi/trace/targets` (**M2**) builds BSS/MLD/ESS views. |
 | Station in root, log kept | `RootConfig` (managed, optional `mlo: true`); S1 gives `debug_level`, `conn_id`, sidecar with outcome and MLD status keys | Association timeout is the monitor's default 15 s; needs to be per activation (folded into **M5**). |
-| One capture adapter per link, own namespace, monitor, fixed channel | `NamespaceConfig{mode: monitor}` moves the phy and creates the VIF; capture WS sets the channel inside the netns | No per-phy band/monitor/EHT capability model (**M1**, absorbs **S4**), no planner (**M3**), no dumpcap-to-file (**M4**). |
+| One capture adapter per link, own namespace, monitor, fixed channel | `NamespaceConfig{mode: monitor}` moves the phy and creates the VIF; capture WS sets the channel inside the netns | No per-phy band/monitor/EHT capability model (**M1**, absorbs **S4**), no planner (**M3**), no dumpcap-to-file (**P6.5**). |
 | Supplicant log read + events | S1 store; S2 planned | S2 not started; needed for the merged timeline. |
-| Start captures, *then* connect | Capture WS does channel set + dumpcap, to a socket only | File sink (**M4**), orchestrator (**M5**). |
+| Start captures, *then* connect | Capture WS does channel set + dumpcap, to a socket only | File sink (**P6.5**), orchestrator (**M5**). |
 | Return log + pcaps + summary | S2 content route for the log | No pcap retrieval anywhere. Manifest + download (**M6**). Summary (**M7**). |
 | Docs an AI can use | `openapi_docs.py` tag/response pattern | New tag, examples, error enums, operationIds, guide lesson, classroom L15/L16 (**M8**). |
 
@@ -236,7 +238,7 @@ and the only loss mode is disk throughput, which the manifest reports
 streamed during a trace; progress is `fileBytes` per link on the session
 descriptor.
 
-### 6.2 dumpcap invocation (M4)
+### 6.2 dumpcap invocation (P6.5)
 
 ```
 ip netns exec trc_<n> dumpcap -i wlanpi<N> -q -t
@@ -247,8 +249,8 @@ ip netns exec trc_<n> dumpcap -i wlanpi<N> -q -t
 
 The channel is set once before start, reusing `_set_channel` + `_ns_prefix`
 extracted from `ConnectionManager` into `streaming/capture_runner.py` that
-both callers import — that extraction *is* M4, no behaviour change on the
-WS side. The interface claim goes into the same registry so the WS and the
+both callers import — that extraction *is* P6.5, no behaviour change on
+the WS side. The interface claim goes into the same registry so the WS and the
 trace cannot both own `wlanpi2`.
 
 **Sizing rule of thumb** (busy 5 GHz channel ≈ 4 000 frames/s):
@@ -485,30 +487,59 @@ error contract, planner — is identical. That is why the resource is
 
 ---
 
-## 13. PR stack (one concern each, ≤ ~400 lines, targets `dev` once S1 is in)
+## 13. Branches and PR stack (one concern each, ≤ ~400 lines)
+
+### 13.1 Where each piece lives
+
+This plan and the blueprint are a **docs-only** concern on
+`docs/connection-trace-plan`, forked from `docs/capture-ws-lifetime-plan`
+and sent as a fork PR into it, exactly as the lifetime plan was. **None of
+this work belongs on `feature/capture-detach-p64`:** P6.4 is detached
+bounded captures and nothing else.
+
+Two bases, decided by what each PR touches:
+
+| Base | Which PRs | Why |
+|---|---|---|
+| **P6 stack tip** (`feature/capture-detach-p64`) | **P6.5** only | It edits `streaming/connection_manager.py`, whose namespace-aware capture primitives exist *only* on the P6 stack. On `dev` the method is `_set_channel(iface, freq, width)` with no namespace argument, and neither `_ns_prefix` nor `_resolve_namespace` exists; the interface-claim registry the file sink must share is P6's `did`-owned model. Branching it from `dev` would mean writing the netns machinery twice and guaranteeing a conflict when #165 merges. |
+| **`dev`** | S2, S3, M1, M2, M3 | New modules and read-only routes. They touch no capture WS code, so they need nothing from the P6 line. |
+
+Everything downstream of P6.5 (M5 onward) inherits its base until #165 and
+the P6.x stack merge upstream; the whole line is then re-sent against `dev`
+in order, per `capture-ws-lifetime-plan.md` §2.
+
+### 13.2 The stack
 
 ```
 dev
-├── S2 feature/supplicant-log-api        (log read routes + parse_events)        [prereq, planned]
-├── S3 feature/scan-mld-fields           (mld + band on scan rows)               [needed for MLD targets only]
+├── S2 feature/supplicant-log-api        log read routes + parse_events           [prereq, planned]
+├── S3 feature/scan-mld-fields           mld + band on scan rows                  [MLD targets only]
 ├── M1 feature/trace-adapter-inventory   GET /wifi/trace/adapters; parsed phy caps (absorbs S4)
 ├── M2 feature/trace-targets             GET /wifi/trace/targets (bss/ess now; mld once S3 lands)
-├── M3 feature/trace-plan                planner + POST /wifi/trace/plan + CSV matrix        needs M1, M2
-├── M4 feature/capture-file-sink         capture_runner extraction; file sink; shared claims
-├── M5 feature/trace-session             orchestrator, state machine, persistence, routes   needs M3, M4, S1
-├── M6 feature/trace-artifacts           manifest, download (Range), retention, nginx     needs M5
-├── M7 feature/trace-summary             802.11 parser, merged timeline, /summary          needs M6, S2
-└── M8 docs/connection-trace-docs        OpenAPI polish, guide Lesson 13, classroom L15/L16
+└── M3 feature/trace-plan                planner + POST /wifi/trace/plan + CSV matrix   needs M1, M2
+
+feature/capture-auth (P6, #165) → P6.1 → P6.2 → P6.3 → feature/capture-detach-p64 (P6.4)
+└── P6.5 feature/capture-file-sink-p65   capture_runner extraction; dumpcap -w file sink;
+    │                                    claims shared with the WS. No WS behaviour change.
+    ├── M5 feature/trace-session         orchestrator, state machine, persistence, routes  needs M3, S1
+    ├── M6 feature/trace-artifacts       manifest, download (Range), retention, nginx      needs M5
+    ├── M7 feature/trace-summary         802.11 parser, merged timeline, /summary          needs M6, S2
+    └── M8 docs/connection-trace-docs    OpenAPI polish, guide Lesson 13, classroom L15/L16
 ```
 
-A single-link trace is usable after M1–M6 with S1 (no S2/S3 needed: the
-summary is M7, the log is still retrievable by `conn_id` once S2 exists,
-and until then by the file path in the manifest). MLD targets need S3 in
-M2. M1/M2/M4 are independent and can go in parallel. M5 is the one to
+**P6.5 is the one that must stay small and boring.** It moves `_ns_prefix`,
+`_resolve_namespace` and `_set_channel` into `streaming/capture_runner.py`,
+adds a file-sink start/stop the WebSocket path does not call, and leaves
+every existing capture WS test passing unchanged. If it acquires a
+behaviour change, it is the wrong PR.
+
+A single-link trace is usable after M1, M2, M3, P6.5, M5 and M6 with S1
+(the summary is M7; until then the log is retrievable by the file path in
+the manifest, and by `conn_id` once S2 lands). MLD targets need S3 in M2.
+M1, M2 and P6.5 are independent and can go in parallel. M5 is the one to
 review hardest; split it M5a (orchestrator + tests, no routes) and M5b
-(routes) if it passes 400 lines. Debian changelog bumps on M1–M7; none on
-M8. Until the P6.x stack and S1 merge upstream, follow the fork-PR rule in
-`capture-ws-lifetime-plan.md` §2.
+(routes) if it passes 400 lines. Debian changelog bumps on P6.5 and M1–M7;
+none on M8 or the docs branch.
 
 **Test rules that bite** (AGENTS.md): the orchestrator is asyncio with real
 subprocesses in production — inject `_clock`, `_sleep`, and a process

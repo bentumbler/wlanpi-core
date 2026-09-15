@@ -63,7 +63,13 @@ feature/capture-auth (P6, #165)
     └── feature/capture-descriptor-clock-p62 (P6.2)
         └── feature/capture-duration-p63 (P6.3)
             └── feature/capture-detach-p64 (P6.4)
+                └── feature/capture-file-sink-p65 (P6.5)
 ```
+
+P6.5 is not scoped here: it is the file-sink extraction the connection
+trace needs, scoped in [`connection-trace-plan.md`](./connection-trace-plan.md)
+§13. It sits on this stack only because the namespace-aware capture
+primitives it moves exist nowhere else.
 
 P6.2 does not functionally depend on P6.1, but both touch the descriptor,
 `start_streaming`, and Lesson 11, so stacking avoids merge noise.
@@ -164,6 +170,7 @@ a bounded capture detaches rather than ends.
 | P6.2 | `feature/capture-descriptor-clock-p62` | implemented (2026-09-07); fork PR into P6.1, upstream after #165 |
 | P6.3 | `feature/capture-duration-p63` | implemented (2026-09-07); fork PR into P6.2. `remaining_sec` is a ceiling so a fresh capture says "60 left", not 59 |
 | P6.4 | `feature/capture-detach-p64` | implemented (2026-09-07); fork PR into P6.3. Merged to `integration/mcp-prague` for device testing |
+| P6.5 | `feature/capture-file-sink-p65` | not started; scoped in [`connection-trace-plan.md`](./connection-trace-plan.md) §13. `capture_runner` extraction + `dumpcap -w` file sink; no WS behaviour change |
 
 Device verification still to do on a WLAN Pi (unit tests mock dumpcap/iw):
 owner `--duration 20` ends with `DURATION_ELAPSED`; subscriber keeps receiving
