@@ -82,7 +82,18 @@ to remember:
    classroom rule that an agent never authorises a degraded run on its own.
 2. **Tool descriptions state the safety envelope**: the station phy is
    never used for capture; the trace never transmits from capture adapters;
-   `keepConnected: false` is the default so the box is left as found.
+   `keepConnected: false` is the default so the box is left as found; and a
+   trace changes nothing another API consumer can see except that adapters
+   it holds are marked busy for the duration (plan §14).
+3. **Do not set `filterMode: "full"` to "be safe".** `focused` is the
+   default because file size is the binding constraint, and it already
+   keeps the station's probe requests, broadcast deauthentication and
+   group-addressed traffic (plan §6.2). `full` is for a human who has asked
+   to see the rest of the channel, and on a long run it is the difference
+   between a fetchable file and a multi-gigabyte one. `mgmt_only` drops the
+   data that `linkUsage` counts, so never pick it for a roam question.
+4. **Do not set `allowBorrowIdleManaged` without asking.** It moves an idle
+   `wlan0`-style interface out of the root namespace for the duration.
 
 Scope choice belongs to the human: `target` for "show me the association",
 `ess` for "show me the roam". The tool description for `trace_plan` should

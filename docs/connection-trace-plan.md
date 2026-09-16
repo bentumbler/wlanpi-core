@@ -75,7 +75,7 @@ capture.
 | Need | Have | Gap |
 |---|---|---|
 | Find the target and its links | `GET /utils/wlan/scan?detail=full` returns freq/width/`amendments`; no MLD grouping, no `band` | **S3** (`mld`, `band` on scan rows); `GET /wifi/trace/targets` (**M2**) builds BSS/MLD/ESS views. |
-| Station in root, log kept | `RootConfig` (managed, optional `mlo: true`); S1 gives `debug_level`, `conn_id`, sidecar with outcome and MLD status keys | Association timeout is the monitor's default 15 s; needs to be per activation (folded into **M5**). |
+| Station in root, log kept | `RootConfig` (managed, optional `mlo: true`); S1 gives `debug_level`, `conn_id`, sidecar with outcome and MLD status keys | None on the API: the orchestrator calls `ConnectionMonitor.start_monitor(timeout=…)` directly (**M5**). No change to S1's activate route. |
 | One capture adapter per link, own namespace, monitor, fixed channel | `NamespaceConfig{mode: monitor}` moves the phy and creates the VIF; capture WS sets the channel inside the netns | No per-phy band/monitor/EHT capability model (**M1**, absorbs **S4**), no planner (**M3**), no dumpcap-to-file (**P6.5**). |
 | Supplicant log read + events | S1 store; S2 planned | S2 not started; needed for the merged timeline. |
 | Start captures, *then* connect | Capture WS does channel set + dumpcap, to a socket only | File sink (**P6.5**), orchestrator (**M5**). |
@@ -103,7 +103,7 @@ like NetConfig activate).
 
 | Route | operationId | Returns |
 |---|---|---|
-| `GET /wifi/trace/adapters` | `trace_adapters` | Per-phy inventory: `phy`, `driver`, `bus`, `bands: ["2.4","5","6"]`, `maxWidthMhz` per band, `monitorCapable`, `ehtCapable`, `interfaces[] {iface, mode, namespace, associatedSsid}`, `eligibility: {station: bool, stationMlo: bool, capture: bool, reasons[]}`. Reasons enum: `NOT_EHT`, `NO_MONITOR`, `SHARED_WITH_MANAGED`, `MANAGEMENT_PATH`, `CLAIMED_BY_CAPTURE`, `IN_ACTIVE_CONFIG`, `PINNED_STATION_PHY`. |
+| `GET /wifi/trace/adapters` | `trace_adapters` | Per-phy inventory: `phy`, `driver`, `bus`, `bands: ["2.4","5","6"]`, `maxWidthMhz` per band, `monitorCapable`, `ehtCapable`, `interfaces[] {iface, mode, namespace, associatedSsid, busy}`, `eligibility: {station: bool, stationMlo: bool, capture: bool, reasons[]}`. Reasons enum: `NOT_EHT`, `NO_MONITOR`, `SHARED_WITH_MANAGED`, `MANAGEMENT_PATH`, `CLAIMED_BY_CAPTURE`, `IN_ACTIVE_CONFIG`, `IDLE_MANAGED_NOT_BORROWED`, `PINNED_STATION_PHY`. `busy` marks an interface claimed by a running trace or capture WS session (§14.2 B4). |
 | `GET /wifi/trace/targets?ssid=&iface=&namespace=` | `trace_targets` | Scan (same adapter-selection contract as `/utils/wlan/scan`, so `needsSelection` can come back) and resolve: `targets[] {ssid, kind: "bss"|"mld", bssid|mldAddr, security, signal, links[]}` and `ess[] {ssid, bssCount, channels[]}`. A classic BSS is a target with one link; an MLD is one target with N links; an ESS of three classic APs is three targets sharing an `ess` entry. |
 | `POST /wifi/trace/plan` | `trace_plan` | Dry run of the assignment rule (§5). Body = the `target` and `capture` parts of a session request. Returns a `Plan` (§4.3). Never fails on feasibility; feasibility is data in the plan. |
 
@@ -129,7 +129,8 @@ POST /wifi/trace/sessions
   "station": {"phy": null, "security": {"security": "WPA2-PSK", "psk": "…"},
               "debugLevel": 2, "associationTimeoutSec": 30, "keepConnected": false},
   "capture": {"scope": "target", "bandPriority": ["6", "5", "2.4"], "minLinksCovered": "all",
-              "snaplenBytes": null, "captureFilter": null, "maxFileMb": 512},
+              "filterMode": "focused", "snaplenBytes": null, "captureFilter": null,
+              "maxFileMb": 512, "allowBorrowIdleManaged": false},
   "timing": {"profile": "assoc", "captureDurationSec": null, "prerollSec": 3,
              "postFailureHoldSec": 10},
   "label": "lab AP, desk 4"
@@ -143,7 +144,9 @@ POST /wifi/trace/sessions
   resolved target is an MLD); more than one → `STATION_NEEDS_SELECTION`.
   `keepConnected: false` deactivates the station on finalise (default).
 - `capture.scope` `target` | `ess` (§2). `minLinksCovered` ∈ `"all" | "any" | <int>`, default `"all"`.
-- `timing.profile`: `assoc` → 45 s capture; `roam` → 600 s and `snaplenBytes: 256`. Explicit values win. `captureDurationSec` 5–3600.
+- `capture.filterMode` `focused` (default) | `full` | `mgmt_only` (§6.2). `captureFilter` is a raw BPF override.
+- `capture.allowBorrowIdleManaged` (default `false`) lets the planner move a phy that hosts an *idle* managed interface such as `wlan0`. Off by default because it removes that interface from root for the duration (§14.2 B5).
+- `timing.profile`: `assoc` → 45 s capture; `roam` → 600 s and `snaplenBytes: 512`. Explicit values win. `captureDurationSec` 5–3600.
 - Security is redacted in every response (`NetSecurity.__str__` already
   does this for logs; the response model omits the field).
 
@@ -190,8 +193,12 @@ matrix (`tests/scenarios/trace_plan_matrix.csv`, AGENTS rule 8).
    not the interface carrying the API client's route (`MANAGEMENT_PATH`),
    not claimed by a running capture WS session (`CLAIMED_BY_CAPTURE`), not
    part of another active NetConfig (`IN_ACTIVE_CONFIG`). A phy hosting an
-   *idle* managed interface **is** eligible; the orchestrator moves the
-   whole phy and brings it back on teardown.
+   *idle* managed interface is eligible **only** when the caller sets
+   `capture.allowBorrowIdleManaged` (reason `IDLE_MANAGED_NOT_BORROWED`
+   otherwise): moving it removes that interface from root for the duration,
+   which other API consumers can see (§14.2 B5). When borrowed, teardown
+   recreates it on its original phy, in root, with its original name and
+   type.
 3. **Order the links.** Links whose band is in `bandPriority`, in that
    order; then the rest in scan order (strongest first). In `ess` scope a
    channel shared by two APs is one link.
@@ -238,41 +245,95 @@ and the only loss mode is disk throughput, which the manifest reports
 streamed during a trace; progress is `fileBytes` per link on the session
 descriptor.
 
-### 6.2 dumpcap invocation (P6.5)
+### 6.2 dumpcap invocation and the capture filter (P6.5)
 
 ```
 ip netns exec trc_<n> dumpcap -i wlanpi<N> -q -t
     -w <dir>/link<id>_<band>ghz_<iface>.pcapng
     -a filesize:<maxFileMb*1024>            # hard cap; link marked TRUNCATED
-    [-s <snaplen>] [-f "<captureFilter>"]
+    -s <snaplen>                            # default 512, see below
+    -f "<per-link filter>"                  # built at `preparing`, see below
 ```
 
 The channel is set once before start, reusing `_set_channel` + `_ns_prefix`
 extracted from `ConnectionManager` into `streaming/capture_runner.py` that
 both callers import — that extraction *is* P6.5, no behaviour change on
-the WS side. The interface claim goes into the same registry so the WS and the
-trace cannot both own `wlanpi2`.
+the WS side (§14.3). The interface claim goes into the same registry so the
+WS and the trace cannot both own `wlanpi2`.
 
-**Sizing rule of thumb** (busy 5 GHz channel ≈ 4 000 frames/s):
+**Filtering is on by default, because file size is the binding constraint.**
+Each link gets its own `-f`, built after the plan is fixed, when that link's
+BSSID is known. `capture.filterMode`:
 
-| Profile | Filter | Snaplen | 45 s | 10 min | 60 min |
-|---|---|---|---|---|---|
-| `assoc` | none | full | ~150 MB worst case per link | — | — |
-| `roam` | none | 256 B | — | ~600 MB/link | ~3.6 GB/link |
+| Mode | Filter | Use |
+|---|---|---|
+| `focused` (default) | the four clauses below | Everything the summary needs, without the rest of the channel |
+| `full` | none | Reference runs, RF forensics, "what else was on air" |
+| `mgmt_only` | `type mgt or ether proto 0x888e` | Long runs where only events matter. Drops data, so `summary.linkUsage` is omitted and `warnings` says so |
 
-`roam` defaults `snaplenBytes: 256`: headers, QoS/TID, sequence, retry flag
-and radiotap rate survive, which is what "which channel/link carried the
-traffic" needs. `maxFileMb` (default 512, cap 4096) is the backstop; a link
+`captureFilter` (raw BPF) still exists and overrides `filterMode`; the
+manifest records which was used.
+
+**The `focused` filter, per link:**
+
+```
+   wlan host <link bssid>          # 1. everything to/from/through this AP link
+or wlan host <station mac>         # 2. frames addressed to us carrying no BSSID (ACK, BlockAck)
+or wlan addr1 ff:ff:ff:ff:ff:ff    # 3. broadcast receiver address
+or (wlan[4] & 1 = 1)               # 4. any group-addressed frame
+```
+
+Clause 1 carries the bulk of the evidence — beacons, probe responses,
+authentication, association, EAPOL and data for the BSS under test — and it
+matches regardless of the station's address, which matters because an MLD's
+per-link station addresses are not known until it associates.
+
+**Clauses 3 and 4 are not garnish; the association is invisible without
+them.** A wildcard Probe Request from the station carries no BSSID at all
+(addr1 and addr3 are broadcast), so a BSSID-only filter hides the whole
+discovery phase. A broadcast Deauthentication is how you learn the BSS
+dropped everyone rather than only us. Group-addressed data is where the
+GTK/IGTK rekey, ARP, DHCP and IPv6 multicast live, which is the difference
+between "associated" and "actually working". Clause 4 (the group bit in
+addr1) subsumes clause 3; both are listed because clause 3 is the portable
+form if the byte test does not compile.
+
+What `focused` drops, and why that is the win: every neighbouring BSS's
+beacons and data. On a busy channel that is the large majority of frames.
+
+**Fail-safe.** dumpcap rejects a bad `-f` at start-up, so a filter mistake
+surfaces immediately rather than as a quiet file. If a link's dumpcap exits
+within the first second with a filter error, core retries that link **once,
+unfiltered**, records `filterFallback: true` on the artifact and adds a
+`warnings` entry. A filter that matches nothing is indistinguishable from a
+quiet channel, and that is the failure mode that wastes a walk test.
+
+**To verify on the box before P6.5 ships** (dumpcap 3.4.16, bullseye
+libpcap): that `wlan[4] & 1 = 1` compiles against a radiotap-headed monitor
+interface, i.e. that libpcap applies the variable radiotap offset to
+`wlan[]` indexing. If it does not, `focused` keeps clauses 1–3 and the
+multicast-data note becomes a documented limitation. Verify `ether proto
+0x888e` the same way before relying on `mgmt_only`.
+
+**Snaplen: 512 by default, not 256.** An Association Request carrying a
+Multi-Link element plus RSN can exceed 256 bytes, and truncating it would
+cut the exact element the summary parses. 512 keeps every management frame
+the parser needs while still discarding data payloads. Smaller values are
+accepted but add a `warnings` entry that management parsing may truncate.
+Full-length frames are needed only when a human wants to read payloads in
+Wireshark.
+
+**Sizing.** `maxFileMb` (default 512, cap 4096) is the backstop; a link
 that hits it ends `TRUNCATED` and the trace continues. Retention: last 5
 sessions or 4 GB, whichever bites first; a running session is never pruned.
 Disk is checked at `plan` (`warnings`) and at create (`507
-INSUFFICIENT_STORAGE` if projected size exceeds free minus 1 GB).
-
-Why not a BPF filter on the station's addresses: for an MLD the per-link
-addresses are unknown until association and dumpcap cannot change its
-filter live; for a classic BSS it would work, so `captureFilter` is a raw
-passthrough (`wlan addr2 <sta> or wlan addr1 <sta> or type mgt` is the
-obvious single-link filter). Default is unfiltered.
+INSUFFICIENT_STORAGE` if the projection exceeds free minus 1 GB). The
+projection uses a measured bytes-per-second-per-link figure, not a guess:
+hardware verification records the same 60 s window in `full` and in
+`focused` on a busy channel, and those numbers replace this paragraph.
+Until then, plan for the unfiltered worst case — a busy 5 GHz channel can
+exceed 4 000 frames/s — and treat `focused` as a reduction to be measured
+rather than a promise.
 
 ### 6.3 Artifacts and download (M6)
 
@@ -312,13 +373,13 @@ planned ──► preparing ──► preroll ──► connecting ──┬─�
 
 | State | What runs | Leaves on |
 |---|---|---|
-| `preparing` | Build and activate the **capture NetConfig** (`_trc_cap_<id>`: one `NamespaceConfig{mode: monitor}` per assignment); set each channel; start each dumpcap. A link whose channel set or dumpcap fails is `linkStatus: FAILED` with the `iw`/dumpcap reason; the trace continues if coverage still meets the bar, else → `failed` with teardown. | all links started (or bar still met) |
+| `preparing` | Build one **in-memory** `NamespaceConfig{mode: monitor}` per assignment and realise it through `NetworkNamespaceService` primitives (create netns, move phy, create VIF); set each channel; start each dumpcap. A link whose channel set or dumpcap fails is `linkStatus: FAILED` with the `iw`/dumpcap reason; the trace continues if coverage still meets the bar, else → `failed` with teardown. | all links started (or bar still met) |
 | `preroll` | Wait `prerollSec` so every radio is demonstrably writing (`fileBytes > 0`; beacons guarantee bytes within a beacon interval). | timer |
-| `connecting` | Activate the **station NetConfig** (`_trc_sta_<id>`: one `RootConfig`, `mlo: true` iff MLD target, `debug_level`), passing `associationTimeoutSec` to the monitor. Poll the S1 sidecar. | sidecar `outcome` |
+| `connecting` | Realise the **in-memory** station `RootConfig` (`mlo: true` iff MLD target, `debug_level`) the same way, calling `ConnectionMonitor.start_monitor(timeout=associationTimeoutSec)` directly. Poll the S1 sidecar. | sidecar `outcome` |
 | `associated` | Record `bssid` (or `apMldAddr` and associated links) from the sidecar. | immediate |
 | `assoc_failed` | Keep capturing for `postFailureHoldSec` (the reject/deauth frames are the evidence). | timer |
 | `capturing` | Run for `captureDurationSec`. Early `stop` → `CALLER_STOP`. Link process exit → link `PROCESS_EXITED`, trace continues. | timer / stop |
-| `finalising` | Stop dumpcaps (SIGINT, wait, SIGTERM); deactivate the capture NetConfig (phys home, namespaces deleted, idle managed VIFs recreated); deactivate the station unless `keepConnected`; copy the supplicant log; hash; write `summary.json`. Each step's failure is recorded in `manifest.stateHistory` and the next step still runs. | done |
+| `finalising` | Stop dumpcaps (SIGINT, wait, SIGTERM); reverse the capture set-up (phys home, only trace-created namespaces deleted, borrowed managed VIFs recreated); stop the station unless `keepConnected`; copy the supplicant log; hash; write `summary.json`. Each step's failure is recorded in `manifest.stateHistory` and the next step still runs. | done |
 
 `endReason` ∈ `DURATION_ELAPSED | CALLER_STOP | ASSOC_FAILED | COVERAGE_LOST |
 STATION_START_FAILED | INTERNAL_ERROR | SERVICE_RESTART`. On core start-up
@@ -326,14 +387,18 @@ any manifest left in a running state is marked `aborted/SERVICE_RESTART`
 and the existing `revert_to_root` cleanup runs for its namespaces; files
 are kept.
 
-Two NetConfigs rather than one: the station must activate *after* the
-captures are on channel, and "one concern per config" keeps the teardown
-paths independent. Both are `_`-prefixed system configs, hidden from `GET
-/network/config/` unless `?system=true`, and deleted on finalise.
+**The orchestrator never touches the stored-config path.** It does not
+create NetConfig files, does not call `activate_config()`, and does not
+write `current.txt`. That is not tidiness: `activate_config()` enforces one
+active config, so it would refuse (409) whenever a user config is active,
+and `override_active` would call `kill_all_supplicants()` and drop the
+user's connections. Full reasoning in §14.1. The orchestrator builds
+`NamespaceConfig` / `RootConfig` objects in memory, drives
+`NetworkNamespaceService` primitives with them, and records in the manifest
+exactly what it created so teardown and start-up recovery can reverse it.
 
-`ConnectionMonitor.start_monitor(timeout=)` already exists;
-`activate_config` gains an optional `association_timeout` query parameter.
-That is the only touch on the S1 path.
+`ConnectionMonitor.start_monitor(timeout=)` already takes the argument the
+orchestrator needs, so the S1 activate route is untouched by this work.
 
 ---
 
@@ -428,7 +493,7 @@ route's `responses=` so it lands in Swagger and in the MCP tool description.
 - Every model is Pydantic with `Field(description=…, examples=[…])` on every
   field, camelCase aliases, and `Literal`/`Enum` for `kind`, `scope`,
   `state`, `endReason`, `band`, `profile`, `eligibility.reasons`,
-  `uncovered.reason`, `linkStatus`.
+  `uncovered.reason`, `linkStatus`, `filterMode`.
 - Three full request examples on `trace_session_create` (single-link
   `assoc`, ESS `roam`, MLD `assoc`) and two `Plan` examples on `trace_plan`
   (feasible single link; MLD one adapter short), via `openapi_examples`.
@@ -464,6 +529,7 @@ route's `responses=` so it lands in Swagger and in the MCP tool description.
 | Station roams to a channel not in scope (`target` scope) | visible only in the supplicant log; summary `warnings` names the new bssid/channel and suggests `scope: "ess"` | yes |
 | 6 GHz disabled by reg domain | `BAND_DISABLED_REGULATORY` | per bar |
 | Adapter unplugged mid-run | link `PROCESS_EXITED`; teardown tolerates a missing phy | yes |
+| Capture filter rejected by dumpcap | one unfiltered retry for that link; `filterFallback: true` + `warnings` (§6.2) | yes |
 | Core restarts | `aborted/SERVICE_RESTART`, namespaces reverted, files kept | — |
 | Disk low | 507 at create; `warnings` at plan | — |
 | Caller disappears | nothing changes: sessions are not socket-bound; the duration cap bounds the radio hold | yes |
@@ -530,8 +596,9 @@ feature/capture-auth (P6, #165) → P6.1 → P6.2 → P6.3 → feature/capture-d
 **P6.5 is the one that must stay small and boring.** It moves `_ns_prefix`,
 `_resolve_namespace` and `_set_channel` into `streaming/capture_runner.py`,
 adds a file-sink start/stop the WebSocket path does not call, and leaves
-every existing capture WS test passing unchanged. If it acquires a
-behaviour change, it is the wrong PR.
+every existing capture WS test passing unchanged. It keeps thin delegating
+methods on `ConnectionManager` so existing patch targets still resolve
+(§14.3). If it acquires a behaviour change, it is the wrong PR.
 
 A single-link trace is usable after M1, M2, M3, P6.5, M5 and M6 with S1
 (the summary is M7; until then the log is retrievable by the file path in
@@ -564,9 +631,61 @@ completes; (11) `roam` walk → `linkUsage` shifts, `link_reconfig` present;
 (12) which `wpa_cli status` keys carry the station's per-link addresses on
 2.11 + this driver (the MLD `linkUsage` depends on it).
 
+Three more that gate the filter and the compatibility claim: (13) each
+`focused` clause compiles under dumpcap 3.4.16, in particular
+`wlan[4] & 1 = 1` against a radiotap monitor interface, and a deliberately
+bad `-f` triggers exactly one unfiltered retry; (14) the same 60 s window
+recorded `full` and `focused` on a busy channel, with the measured sizes
+written back into §6.2, and the `focused` file still containing the
+station's probe requests, the beacons, the four EAPOL frames and at least
+one group-addressed frame; (15) with **no** trace and no capture running,
+`GET /utils/wlan/scan`, `GET /network/interfaces`, `GET /network/config/`
+and `GET /network/config/status` return what they returned before the
+branch, and during a trace the scan does not select a claimed adapter.
+
 ---
 
-## 14. Out of scope (do not smuggle in)
+## 14. Compatibility: what must not break
+
+**The invariant.** With no trace running and no capture session open, every
+existing endpoint returns exactly what it returns today. Everything below is
+either additive or gated on a trace being active. The reviewer's check is
+that P6.5 and M1–M7 **add** tests and edit no existing expectation.
+
+### 14.1 Three things in the first draft that would have broken, and what replaced them
+
+| # | The draft said | What it would have broken | Now |
+|---|---|---|---|
+| 1 | Create `_trc_cap_<id>` / `_trc_sta_<id>` NetConfigs and activate them through `POST /network/config/activate/{id}` | `activate_config()` enforces a single active config: with any user config active it raises `ConfigActiveError` (409), so the trace would fail whenever someone had a config on. With `override_active` it calls `ns.kill_all_supplicants()`, **dropping the user's connections**. On success it overwrites `current.txt`, so the device forgets which config the user activated. | The orchestrator never touches the config store. It builds `NamespaceConfig` / `RootConfig` objects in memory and drives `NetworkNamespaceService` primitives directly. `CONFIG_DIR`, `current.txt`, `kill_all_supplicants` and the single-active-config rule are untouched, and a trace can run while a user config is active. |
+| 2 | Hide trace configs from `GET /network/config/` behind `?system=true` | A new filter on `list_configs()`, a semantic change to a shipped route, for the benefit of configs that no longer exist. | Dropped entirely. No change to `list_configs()`. |
+| 3 | `POST /network/config/activate/{id}` gains `?association_timeout=` | Not breaking, but a public-API change for nothing. | Dropped. `ConnectionMonitor.start_monitor(timeout=…)` already takes it. S1's activate route is untouched. |
+
+### 14.2 Interactions that must be handled, each gated on a trace running
+
+| # | Risk | Rule |
+|---|---|---|
+| B4 | `select_scan_adapter()` counts monitor adapters **across all namespaces**. While a trace holds two or more monitor VIFs, a bare `GET /utils/wlan/scan` would flip to `needsSelection: true`, and auto-selection could pick a capture VIF and **retune a radio mid-trace**. | Adapter enumeration gains `busy: true` for interfaces claimed by a trace or a capture WS session, and scan candidate selection skips busy adapters. With nothing running the candidate list is identical to today. This also fixes a latent form of the same problem with today's capture WS (handover §7). |
+| B5 | Borrowing a phy that hosts an **idle managed** interface removes e.g. `wlan0` from root for the duration, changing `/network/interfaces`, `/network/config/status` and scan selection. | Not eligible by default; `capture.allowBorrowIdleManaged: true` is an explicit caller opt-in. Teardown recreates the VIF on its original phy, in root, with its original name and type, and start-up recovery does the same after a crash. |
+| B6 | `wlanpiN` name collision with an existing monitor VIF. | Allocate the lowest free index across all namespaces. Never rename, retune or delete a VIF the trace did not create. |
+| B7 | Namespace deletion. | Delete only namespaces this trace created, as recorded in the manifest. Never a pre-existing one, even if it matches `trc_*`. |
+| B8 | Capture WS contention. | A trace claim makes a WS `start` on that interface return the **existing** `INTERFACE_IN_USE` error. New contention, no new error code; note it in the handover. |
+| B9 | nginx buffering. | `proxy_buffering off` and `proxy_max_temp_file_size 0` go **inside `location /api/v1/wifi/trace/`** only. Server-wide would change buffering for every endpoint. |
+| B10 | `GET /network/config/status` shows `trc_*` namespaces while a trace runs. | Accepted and documented. The response is a map keyed by namespace, clients iterate keys, and those namespaces genuinely exist. They disappear on finalise. |
+| B11 | S1 log retention (10 attempts) could prune the log a finished trace refers to. | Finalise copies the log and sidecar into the session directory; the trace never depends on the S1 store surviving. |
+
+### 14.3 P6.5 specifically
+
+`tests/test_streaming_processes.py` both patches and calls
+`manager._set_channel(...)` directly, in five places. So the extraction
+**keeps `_set_channel`, `_ns_prefix` and `_resolve_namespace` on
+`ConnectionManager` as thin delegates with unchanged signatures**, with the
+implementation in `streaming/capture_runner.py`. The existing capture tests
+must pass **unedited**; that is the acceptance test for "no behaviour
+change", and a PR that has to touch them is the wrong PR.
+
+---
+
+## 15. Out of scope (do not smuggle in)
 
 - Live tailing of a trace (WS subscribe to a file-backed capture). A later
   PR can `tail` the summary counters if there is a real need.
