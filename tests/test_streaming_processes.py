@@ -51,6 +51,7 @@ def _connected_client(manager, websocket):
         "subscribed_to": None,
         "namespace": None,
         "session_config": None,
+        "started_mono": None,
         "session_end": None,
         "pcapng_buffer": bytearray(),
         "pcapng_header": bytearray(),
@@ -548,3 +549,97 @@ async def test_set_channel_rejects_invalid_center_before_command(mocker):
 
     assert await manager._set_channel("wlanpi0", 5000, 160) is not None
     run_command.assert_not_awaited()
+
+
+# --- Session lifetime on the descriptor (P6.2) -----------------------------
+
+
+class _FakeClock:
+    """Injected in place of manager._clock; tests move `now` explicitly."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_capture_started_and_descriptor_report_elapsed_from_manager_clock(
+    mocker,
+):
+    """Report elapsed_sec from the injected manager clock.
+
+    Nothing here sleeps or patches ``time`` (AGENTS #1, #7). A perpetual
+    capture reports null duration/remaining.
+    """
+    manager = ConnectionManager()
+    clock = _FakeClock(1000.0)
+    manager._clock = clock
+    owner = object()
+    _connected_client(manager, owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+    session_id = manager.clients[owner]["session_id"]
+
+    started = next(
+        call for call in send_event.await_args_list if call.args[2] == "CAPTURE_STARTED"
+    )
+    assert started.args[3]["elapsed_sec"] == 0
+    assert started.args[3]["duration_sec"] is None
+    assert started.args[3]["remaining_sec"] is None
+
+    clock.now = 1030.7
+    descriptor = manager._session_descriptor(session_id, owner)
+    assert descriptor["elapsed_sec"] == 30
+    assert descriptor["duration_sec"] is None
+    assert descriptor["remaining_sec"] is None
+
+    await manager.stop_streaming(owner, notify=False)
+    assert manager.clients[owner]["started_mono"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_list_and_subscribed_carry_lifetime_fields(mocker):
+    """SESSIONS uses send_event; SUBSCRIBED arrives on the subscription queue."""
+    manager = ConnectionManager()
+    clock = _FakeClock(500.0)
+    manager._clock = clock
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
+    session_id = manager.clients[owner]["session_id"]
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+    # Keep the pump from draining the queue so the test can read SUBSCRIBED.
+    mocker.patch.object(manager, "_send_subscription", new=AsyncMock())
+
+    clock.now = 512.2
+    await manager.send_session_list(subscriber)
+    await manager.subscribe(subscriber, session_id)
+
+    listing = next(
+        call for call in send_event.await_args_list if call.args[2] == "SESSIONS"
+    )
+    (session,) = listing.args[3]["sessions"]
+    assert session["session_id"] == session_id
+    assert session["elapsed_sec"] == 12
+    assert session["remaining_sec"] is None
+
+    queue = manager.clients[subscriber]["subscription_queue"]
+    kind, event_text = queue.get_nowait()
+    assert kind == "event"
+    payload = json.loads(event_text)
+    assert payload["code"] == "SUBSCRIBED"
+    assert payload["data"]["elapsed_sec"] == 12
+    assert payload["data"]["duration_sec"] is None
+
+    sub_task = manager.clients[subscriber]["subscription_task"]
+    if sub_task is not None:
+        sub_task.cancel()
+        try:
+            await sub_task
+        except asyncio.CancelledError:
+            pass
+    await manager.stop_streaming(owner, notify=False)

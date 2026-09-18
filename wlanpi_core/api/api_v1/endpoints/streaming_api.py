@@ -136,7 +136,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     stream read-only (`list_sessions` enumerates running captures); only the
     owning connection can `configure`/`stop`. `unsubscribe` detaches. A session
     accepts a limited number of concurrent subscribers; a further `subscribe`
-    gets a `SUBSCRIBER_LIMIT` error.
+    gets a `SUBSCRIBER_LIMIT` error. Session descriptors (`SESSIONS`,
+    `SUBSCRIBED`, `CAPTURE_STARTED`) carry the running `config` plus
+    `elapsed_sec`; `duration_sec`/`remaining_sec` are `null` for a perpetual
+    capture.
 
     **Long-running:** keep connection open for entire capture session; use `stop` before disconnect.
 
