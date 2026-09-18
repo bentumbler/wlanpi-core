@@ -59,6 +59,8 @@ def _connected_client(manager, websocket):
         "duration_sec": None,
         "deadline_task": None,
         "stop_reason": None,
+        "owner_attached": True,
+        "orphan_task": None,
         "session_end": None,
         "pcapng_buffer": bytearray(),
         "pcapng_header": bytearray(),
@@ -658,17 +660,25 @@ async def test_session_list_and_subscribed_carry_lifetime_fields(mocker):
 class _FakeSleep:
     """Injected as manager._sleep.
 
-    Records the requested delay and blocks until the test releases it, so
-    expiry is driven by an event and never by the wall clock (AGENTS #1).
+    Records the requested delay and blocks until the test releases that delay,
+    so expiry is driven by an event and never by the wall clock (AGENTS #1).
+    Keyed by delay because a detached bounded capture has two sleepers: the
+    deadline and the orphan grace.
     """
 
     def __init__(self):
         self.delays = []
-        self.release = asyncio.Event()
+        self._events = {}
+
+    def release(self, delay):
+        self.event_for(delay).set()
+
+    def event_for(self, delay):
+        return self._events.setdefault(delay, asyncio.Event())
 
     async def __call__(self, delay):
         self.delays.append(delay)
-        await self.release.wait()
+        await self.event_for(delay).wait()
 
 
 class EndingStdout:
@@ -790,7 +800,7 @@ async def test_duration_elapsed_stops_capture_and_tells_owner_and_subscriber(
     send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
     deadline_task = manager.clients[owner]["deadline_task"]
 
-    sleep.release.set()
+    sleep.release(5)
     await deadline_task
 
     assert process.terminated is True
@@ -835,7 +845,7 @@ async def test_manual_stop_cancels_the_duration_timer(mocker):
     assert manager.clients[owner]["deadline_task"] is None
     (stopped,) = _events(send_event, "CAPTURE_STOPPED")
     assert stopped.args[3]["reason"] == "OWNER_STOP"
-    sleep.release.set()
+    sleep.release(60)
     assert len(_events(send_event, "CAPTURE_STOPPED")) == 1
 
 
@@ -904,3 +914,186 @@ async def test_process_exit_cancels_the_duration_timer(mocker):
     (ended,) = _events(send_event, "CAPTURE_ENDED")
     assert ended.args[3]["reason"] == "PROCESS_EXITED"
     assert manager.sessions == {}
+
+
+# --- Detached bounded captures (P6.4) ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bounded_owner_disconnect_detaches_without_stopping(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    _connected_client(manager, owner)
+    manager.clients[owner]["did"] = "owner-did"
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    session_id = manager.clients[owner]["session_id"]
+
+    await manager.disconnect(owner)
+
+    assert process.terminated is False
+    assert session_id in manager.sessions
+    assert manager.clients[owner]["owner_attached"] is False
+    assert manager.clients[owner]["orphan_task"] is not None
+    assert sleep.delays[-1] == connection_manager.ORPHAN_GRACE_SEC
+    # Keep the session alive for later tests' cleanup path.
+    await manager.stop_streaming(owner, notify=False, reason="OWNER_STOP")
+
+
+@pytest.mark.asyncio
+async def test_perpetual_owner_disconnect_stops_capture(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    _connected_client(manager, owner)
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}]
+    )
+
+    await manager.disconnect(owner)
+
+    assert process.terminated is True
+    assert manager.sessions == {}
+    assert owner not in manager.clients
+
+
+@pytest.mark.asyncio
+async def test_orphan_grace_stops_detached_capture_with_no_listeners(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    _connected_client(manager, owner)
+    manager.clients[owner]["did"] = "owner-did"
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    await manager.disconnect(owner)
+    orphan = manager.clients[owner]["orphan_task"]
+    # Disarm the duration timer so only the orphan path is under test when
+    # FakeSleep is released (one Event wakes every waiter).
+    manager._cancel_deadline(manager.clients[owner])
+
+    sleep.release.set()
+    await orphan
+
+    assert process.terminated is True
+    assert manager.sessions == {}
+    assert owner not in manager.clients
+
+
+@pytest.mark.asyncio
+async def test_bare_stop_without_attached_capture_requires_session_id(mocker):
+    manager = ConnectionManager()
+    sleep = _FakeSleep()
+    manager._sleep = sleep
+    owner = object()
+    other = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, other)
+    manager.clients[owner]["did"] = "owner-did"
+    manager.clients[other]["did"] = "owner-did"
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    session_id = manager.clients[owner]["session_id"]
+    await manager.disconnect(owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.stop_session(other, None)
+
+    err = next(
+        c for c in send_event.await_args_list if c.args[2] == "STOP_REQUIRES_SESSION"
+    )
+    assert err.args[3]["sessions"] == [session_id]
+    assert session_id in manager.sessions
+    await manager.stop_streaming(owner, notify=False, reason="OWNER_STOP")
+
+
+@pytest.mark.asyncio
+async def test_configure_on_detached_interface_is_control_not_allowed(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    other = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, other)
+    manager.clients[owner]["did"] = "owner-did"
+    manager.clients[other]["did"] = "owner-did"
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    session_id = manager.clients[owner]["session_id"]
+    await manager.disconnect(owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.apply_configuration(
+        other, _configs(wlanpi0={"channels": [{"freq": 5180, "width": 20}]})
+    )
+
+    err = next(
+        c for c in send_event.await_args_list if c.args[2] == "CONTROL_NOT_ALLOWED"
+    )
+    assert err.args[3]["session_id"] == session_id
+    assert err.args[3]["owner_attached"] is False
+    assert "stop" in err.args[3]["allowed"]
+    await manager.stop_streaming(owner, notify=False, reason="OWNER_STOP")
+
+
+@pytest.mark.asyncio
+async def test_stop_session_by_id_from_same_did_stops_detached(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    other = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, other)
+    manager.clients[owner]["did"] = "owner-did"
+    manager.clients[other]["did"] = "owner-did"
+    process, _, _ = await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    session_id = manager.clients[owner]["session_id"]
+    await manager.disconnect(owner)
+    send_event = mocker.patch.object(manager, "send_event", new=AsyncMock())
+
+    await manager.stop_session(other, session_id)
+
+    assert process.terminated is True
+    assert manager.sessions == {}
+    stopped = _events(send_event, "CAPTURE_STOPPED")
+    assert any(c.args[0] is other for c in stopped)
+    assert all(c.args[3]["reason"] == "OWNER_STOP" for c in stopped)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_skips_detached_owner_but_queues_subscribers(mocker):
+    manager = ConnectionManager()
+    manager._sleep = _FakeSleep()
+    owner = object()
+    subscriber = object()
+    _connected_client(manager, owner)
+    _connected_client(manager, subscriber)
+    manager.clients[owner]["did"] = "owner-did"
+    await _running_capture(
+        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
+    )
+    session_id = manager.clients[owner]["session_id"]
+    await manager.disconnect(owner)
+    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=128)
+    manager.clients[subscriber]["subscribed_to"] = session_id
+    manager.clients[subscriber]["subscription_queue"] = queue
+    manager.clients[owner]["subscribers"].add(subscriber)
+    manager._cancel_orphan(manager.clients[owner])
+
+    # Minimal SHB+IDB so framing yields a block; use a tiny complete-looking chunk
+    # that _pcapng_blocks may buffer. Queue still receives whatever completes.
+    chunk = b"\x0a\x0d\x0d\x0a" + b"\x00" * 24
+    await manager._broadcast_chunk(owner, manager.clients[owner], chunk)
+
+    # Detached owner must not be asked to send_bytes (object has none).
+    assert manager.clients[owner]["owner_attached"] is False
+    await manager.stop_streaming(owner, notify=False, reason="OWNER_STOP")
