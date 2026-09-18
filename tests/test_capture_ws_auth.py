@@ -244,15 +244,16 @@ async def test_subscriber_receives_broadcast_and_stop_notification():
         packet,
     ]
 
-    await mgr._end_session(client, "CAPTURE_STOPPED", "Capture stopped.")
+    await mgr._end_session(client, "CAPTURE_STOPPED", "Capture stopped.", "OWNER_STOP")
     await asyncio.wait_for(events["CAPTURE_STOPPED"].wait(), timeout=1)
     await subscription_task
     assert mgr.sessions == {}
     assert client["subscribers"] == set()
     assert mgr.clients[listener]["subscribed_to"] is None
-    # The stop notification reached the listener.
-    sent = [c.args[0] for c in listener.send_text.await_args_list]
-    assert any("CAPTURE_STOPPED" in payload for payload in sent)
+    # The stop notification, with its reason, reached the listener.
+    sent = [json.loads(c.args[0]) for c in listener.send_text.await_args_list]
+    stopped = next(e for e in sent if e["code"] == "CAPTURE_STOPPED")
+    assert stopped["data"]["reason"] == "OWNER_STOP"
 
 
 @pytest.mark.asyncio
@@ -307,7 +308,7 @@ async def test_late_subscriber_gets_header_then_complete_packet_blocks():
     await asyncio.wait_for(all_blocks.wait(), timeout=1)
 
     assert received == [PCAPNG_HEADER, second_packet]
-    await mgr._end_session(client, "CAPTURE_ENDED", "Capture ended.")
+    await mgr._end_session(client, "CAPTURE_ENDED", "Capture ended.", "PROCESS_EXITED")
     await subscription_task
 
 
@@ -451,7 +452,9 @@ async def test_old_session_end_does_not_clear_new_subscription():
     await mgr._broadcast_chunk(old_owner, old_client, PCAPNG_HEADER)
     await asyncio.wait_for(binary_send_started.wait(), timeout=1)
 
-    await mgr._end_session(old_client, "CAPTURE_ENDED", "Capture ended.")
+    await mgr._end_session(
+        old_client, "CAPTURE_ENDED", "Capture ended.", "PROCESS_EXITED"
+    )
     await mgr.subscribe(listener, "cap_new")
     new_subscription_task = mgr.clients[listener]["subscription_task"]
     await asyncio.wait_for(second_subscription.wait(), timeout=1)
@@ -462,7 +465,9 @@ async def test_old_session_end_does_not_clear_new_subscription():
         json.loads(call.args[0])["code"] for call in listener.send_text.await_args_list
     ]
     assert sent_codes == ["SUBSCRIBED", "SUBSCRIBED"]
-    await mgr._end_session(new_client, "CAPTURE_ENDED", "Capture ended.")
+    await mgr._end_session(
+        new_client, "CAPTURE_ENDED", "Capture ended.", "PROCESS_EXITED"
+    )
     await new_subscription_task
 
 
@@ -586,7 +591,9 @@ async def test_subscriber_stop_is_rejected_without_ending_owner_session():
     sent = [c.args[0] for c in listener.send_text.await_args_list]
     assert any("SUBSCRIBER_READ_ONLY" in payload for payload in sent)
     await mgr.disconnect(listener)
-    await mgr._end_session(mgr.clients[owner], "CAPTURE_ENDED", "Capture ended.")
+    await mgr._end_session(
+        mgr.clients[owner], "CAPTURE_ENDED", "Capture ended.", "PROCESS_EXITED"
+    )
 
 
 @pytest.mark.asyncio
@@ -613,4 +620,6 @@ async def test_subscriber_cannot_start_another_capture(mocker):
     sent = [call.args[0] for call in listener.send_text.await_args_list]
     assert any("SUBSCRIBER_READ_ONLY" in payload for payload in sent)
     await mgr.disconnect(listener)
-    await mgr._end_session(mgr.clients[owner], "CAPTURE_ENDED", "Capture ended.")
+    await mgr._end_session(
+        mgr.clients[owner], "CAPTURE_ENDED", "Capture ended.", "PROCESS_EXITED"
+    )
