@@ -980,7 +980,7 @@ async def test_orphan_grace_stops_detached_capture_with_no_listeners(mocker):
     # FakeSleep is released (one Event wakes every waiter).
     manager._cancel_deadline(manager.clients[owner])
 
-    sleep.release.set()
+    sleep.release(connection_manager.ORPHAN_GRACE_SEC)
     await orphan
 
     assert process.terminated is True
