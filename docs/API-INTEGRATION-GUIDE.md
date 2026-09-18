@@ -482,7 +482,8 @@ and every subscriber can see the plan in `duration_sec`/`remaining_sec`. Omit
 it and the capture is perpetual, exactly as before. Every end says why:
 `CAPTURE_STOPPED` carries `data.reason` = `OWNER_STOP`, `OWNER_DISCONNECT` or
 `DURATION_ELAPSED`; `CAPTURE_ENDED` (dumpcap exited) carries `PROCESS_EXITED`.
-The duration cannot be changed on a running capture.
+The duration cannot be changed on a running capture. See 11.5 for what happens
+when a bounded owner disconnects.
 
 ### 11.3 Retune mid-capture
 
@@ -542,7 +543,33 @@ cannot control the capture; `{ "command": "unsubscribe" }` detaches. When the
 owner stops or disconnects, subscribers get `CAPTURE_STOPPED`/`CAPTURE_ENDED`.
 A subscriber that cannot keep up with the stream is closed with code 1013.
 
-### 11.5 Other commands & events
+### 11.5 Bounded and detached captures
+
+A **perpetual** capture (no `duration_sec`) lives with its owner's socket:
+when that socket closes the capture stops at once, subscribers or not, because
+nobody else could stop or retune it.
+
+A **bounded** capture (`duration_sec` set) belongs to the owner's `did`, not
+to the socket. If the owner's socket closes, the capture keeps running for
+whoever is listening — the descriptor then shows `"owner_attached": false` and
+a `subscriber_count` — and ends when one of these happens first:
+
+| End | Reason on `CAPTURE_STOPPED` |
+|---|---|
+| the deadline is reached | `DURATION_ELAPSED` |
+| `{ "command": "stop", "session_id": "cap_…" }` from any connection authenticated as the owner's `did` | `OWNER_STOP` |
+| nobody has been attached (owner or subscriber) for a short grace period (15 s) | `NO_LISTENERS` |
+
+Detach is **listen/stop only**. There is no way to reclaim `configure` on a
+detached session. A reconnecting owner should `list_sessions`: if the session
+is still there, subscribe to listen or `stop` with its `session_id`. A bare
+`{"command": "stop"}` on that new connection is `STOP_REQUIRES_SESSION`
+(`data.sessions` lists the ids to use) and does **not** end the capture.
+Any `configure` or `start` that names an interface that session holds is
+`CONTROL_NOT_ALLOWED` (payload includes `session_id`, `owner_attached: false`,
+and `allowed`).
+
+### 11.6 Other commands & events
 
 `{ "command": "get_supported_frequencies" }` → `SUPPORTED_FREQUENCIES` (channel
 list per capture adapter). Event shape:
@@ -558,8 +585,12 @@ Notable codes: `AUTH_OK`, `AUTH_FAILED`, `CAPTURE_STARTED`, `CHANNEL_SET` /
 on single-radio devices the phy can be briefly busy while the managed interface
 scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
 (sent to subscribers after a live retune), `CAPTURE_STOPPED` /
-`CAPTURE_ENDED` (with `data.reason`, see 11.2), and errors `INTERFACE_IN_USE`,
-`INTERFACE_NOT_AVAILABLE`, `SESSION_NOT_FOUND`, `CONFIG_INVALID`,
+`CAPTURE_ENDED` (with `data.reason`, see 11.2 and 11.5), and errors
+`INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED` (configure/start on an interface a
+detached session holds — listen or stop only), `INTERFACE_NOT_AVAILABLE`,
+`SESSION_NOT_FOUND`, `SESSION_NOT_OWNED`, `STOP_REQUIRES_SESSION` (bare `stop`
+on a socket with no attached capture; `data.sessions` lists ids this `did`
+owns), `CONFIG_INVALID`,
 `CAPTURE_CONFIG_INVALID` (bad `start`, e.g. `duration_sec` out of range),
 `UNKNOWN_COMMAND`.
 

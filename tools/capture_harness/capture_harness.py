@@ -553,6 +553,16 @@ async def run_owner(args) -> None:
         print(f"    capture_harness.py run --subscribe {session_id} --url {args.url}")
         print("=" * 60)
 
+        if getattr(args, "detach", False):
+            if not duration_sec:
+                raise SystemExit("--detach requires --duration (bounded capture)")
+            print(
+                "[detach] leaving bounded capture running; stop later with "
+                f'{{"command": "stop", "session_id": "{session_id}"}}',
+                file=sys.stderr,
+            )
+            return
+
         raw_fp = open(args.raw_out, "wb") if args.raw_out else None
         table = ScanTable()
         deadline = time.monotonic() + args.duration + 15 if args.duration else None
@@ -728,6 +738,12 @@ def main() -> None:
             "subscriber: stop reading after N seconds",
         )
         p.add_argument("--raw-out", help="write raw pcapng stream to this file")
+        p.add_argument(
+            "--detach",
+            action="store_true",
+            help="owner: after start, exit without stop so a bounded "
+            "capture keeps running for subscribers",
+        )
 
     pr = sub.add_parser("run", help="start or subscribe to a capture")
     add_client_args(pr)
