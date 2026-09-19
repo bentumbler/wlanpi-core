@@ -145,7 +145,7 @@ and TPC-report TX power. For full analysis, open the `--raw-out` pcapng in
 Wireshark.
 
 
-### Detach a bounded owner (P6.4)
+### Detach a bounded owner
 
 ```bash
 ./capture_harness.py run --config lab.json --duration 300 --detach

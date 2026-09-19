@@ -133,8 +133,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     `CONFIG_APPLIED` reply reports both sets as `applied_live` and `deferred`;
     subscribers of a retuned capture receive `CONFIG_CHANGED`. Changing the
     interface set or `pcap_filter` still needs `stop` then `start`, since both
-    are fixed when the capture process is launched. Configure is not available
-    on a detached session.
+    are fixed when the capture process is launched.
 
     **Auth:** required. The first message must be
     `{ "command": "auth", "token": "<core JWT>" }` (within 10s); anything else,

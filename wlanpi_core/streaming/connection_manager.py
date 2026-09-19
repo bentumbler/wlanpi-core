@@ -79,7 +79,7 @@ class ConnectionManager:
             "deadline_task": None,
             "stop_reason": None,
             # False once a bounded capture's owner socket has gone away; the
-            # record then lives on as the session until it ends (P6.4).
+            # record then lives on as the session until it ends.
             "owner_attached": True,
             "orphan_task": None,
             "namespace": None,
@@ -233,7 +233,7 @@ class ConnectionManager:
             )
         )
 
-    # -- Detached bounded captures (P6.4) ---------------------------------
+    # -- Detached bounded captures ----------------------------------------
     #
     # A bounded capture belongs to a did, not a socket. When its owner's socket
     # goes away it keeps running - detached - until its deadline, an explicit
@@ -245,56 +245,31 @@ class ConnectionManager:
     def _is_detachable(client: dict[str, Any]) -> bool:
         return client.get("duration_sec") is not None
 
-    def _detached_holder(
-        self, websocket: WebSocket, interfaces: list[str]
-    ) -> tuple[WebSocket, dict[str, Any], str] | None:
-        """Return a detached session holding any of the named interfaces."""
-        for iface in interfaces:
-            owner_ws = self.interface_owners.get(iface)
-            if owner_ws is None or owner_ws is websocket:
-                continue
-            owner_client = self.clients.get(owner_ws) or {}
-            session_id = owner_client.get("session_id")
-            if session_id and not owner_client.get("owner_attached", True):
-                return owner_ws, owner_client, session_id
-        return None
-
-    async def _reject_control_of_detached(
+    async def _reject_start_on_detached(
         self, websocket: WebSocket, interfaces: list[str]
     ) -> bool:
-        """Refuse configure/start on interfaces a detached session holds.
+        """Refuse a start on an interface that a detached session holds.
 
-        Returns True after sending CONTROL_NOT_ALLOWED. Regain control only
-        by stopping that session and starting a new capture.
+        Returns True after sending CONTROL_NOT_ALLOWED. The owner's did may
+        stop that session first; anyone may subscribe to it.
         """
-        held = self._detached_holder(websocket, interfaces)
-        if held is None:
-            return False
-        _, owner_client, session_id = held
-        requester_did = (self.clients.get(websocket) or {}).get("did")
-        same_owner = requester_did is not None and requester_did == owner_client.get(
-            "did"
-        )
-        allowed = ["subscribe", "list_sessions"]
-        if same_owner:
-            allowed.append("stop")
-            message = (
-                f"Session {session_id} is detached; no control except stop. "
-                "Subscribe to listen, or list_sessions. To change the radio, "
-                f'stop it with {{"command": "stop", "session_id": "{session_id}"}} '
-                "and start a new capture."
-            )
+        for iface in interfaces:
+            holder = self.clients.get(self.interface_owners.get(iface)) or {}
+            session_id = holder.get("session_id")
+            if session_id and not holder.get("owner_attached", True):
+                break
         else:
-            message = (
-                f"Session {session_id} is detached; only its owner may stop it. "
-                "Subscribe to listen, or list_sessions."
-            )
+            return False
+        requester_did = (self.clients.get(websocket) or {}).get("did")
+        allowed = ["subscribe", "list_sessions"]
+        if requester_did is not None and requester_did == holder.get("did"):
+            allowed.append("stop")
         await self.send_event(
             websocket,
             "error",
             "CONTROL_NOT_ALLOWED",
             {
-                "message": message,
+                "message": f"Session {session_id} is detached: listen or stop only.",
                 "session_id": session_id,
                 "owner_attached": False,
                 "allowed": allowed,
@@ -341,8 +316,8 @@ class ConnectionManager:
 
         Without a session_id, stop this socket's attached capture. A
         reconnecting socket is not the attached owner, so a bare stop is
-        STOP_REQUIRES_SESSION. With a session_id, stop that session if this
-        socket owns it or shares the owner's did.
+        STOP_REQUIRES_SESSION. With a session_id, any socket authenticated as
+        the owner's did may stop it, whether or not the owner is attached.
         """
         if session_id is None:
             client = self.clients.get(websocket)
@@ -359,23 +334,14 @@ class ConnectionManager:
                 for sid, owner_ws in self.sessions.items()
                 if did and (self.clients.get(owner_ws) or {}).get("did") == did
             )
-            if len(owned) == 1:
-                message = (
-                    "This connection has no attached capture. Stop a detached "
-                    f'session with {{"command": "stop", "session_id": "{owned[0]}"}}.'
-                )
-            elif owned:
-                message = (
-                    "This connection has no attached capture. Stop a session "
-                    'with {"command": "stop", "session_id": "<id>"}.'
-                )
-            else:
-                message = "This connection has no attached capture to stop."
             await self.send_event(
                 websocket,
                 "error",
                 "STOP_REQUIRES_SESSION",
-                {"message": message, "sessions": owned},
+                {
+                    "message": "No attached capture here; stop by session_id.",
+                    "sessions": owned,
+                },
             )
             return
         owner_ws = self.sessions.get(session_id)
@@ -844,9 +810,6 @@ class ConnectionManager:
         if client is None:
             return
 
-        if await self._reject_control_of_detached(websocket, list(configs)):
-            return
-
         for iface, config in configs.items():
             self.configure(websocket, iface, config)
 
@@ -1093,7 +1056,7 @@ class ConnectionManager:
 
         conflicts = self._claim_interfaces(websocket, interfaces)
         if conflicts:
-            if await self._reject_control_of_detached(websocket, conflicts):
+            if await self._reject_start_on_detached(websocket, conflicts):
                 return
             await self.send_message_event(
                 websocket,
