@@ -860,20 +860,17 @@ async def test_owner_disconnect_reports_reason_to_subscribers(mocker):
     subscriber = object()
     _connected_client(manager, owner)
     _connected_client(manager, subscriber)
-    await _running_capture(
-        manager, mocker, owner, [{"freq": 2412, "width": 20}], duration_sec=60
-    )
+    # Perpetual: a bounded capture would detach instead of stopping.
+    await _running_capture(manager, mocker, owner, [{"freq": 2412, "width": 20}])
     session_id = manager.clients[owner]["session_id"]
     mocker.patch.object(manager, "_send_subscription", new=AsyncMock())
     await manager.subscribe(subscriber, session_id)
     queue = manager.clients[subscriber]["subscription_queue"]
     while not queue.empty():
         queue.get_nowait()
-    deadline_task = manager.clients[owner]["deadline_task"]
 
     await manager.disconnect(owner)
 
-    assert deadline_task.cancelled() or deadline_task.done()
     assert owner not in manager.clients
     kind, event_text = queue.get_nowait()
     assert kind == "event"
@@ -919,7 +916,7 @@ async def test_process_exit_cancels_the_duration_timer(mocker):
     assert manager.sessions == {}
 
 
-# --- Detached bounded captures (P6.4) ---------------------------------------
+# --- Detached bounded captures ---------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -941,6 +938,7 @@ async def test_bounded_owner_disconnect_detaches_without_stopping(mocker):
     assert session_id in manager.sessions
     assert manager.clients[owner]["owner_attached"] is False
     assert manager.clients[owner]["orphan_task"] is not None
+    await asyncio.sleep(0)  # let the orphan task reach its sleep
     assert sleep.delays[-1] == connection_manager.ORPHAN_GRACE_SEC
     # Keep the session alive for later tests' cleanup path.
     await manager.stop_streaming(owner, notify=False, reason="OWNER_STOP")
@@ -1017,7 +1015,7 @@ async def test_bare_stop_without_attached_capture_requires_session_id(mocker):
 
 
 @pytest.mark.asyncio
-async def test_configure_on_detached_interface_is_control_not_allowed(mocker):
+async def test_start_on_detached_interface_is_control_not_allowed(mocker):
     manager = ConnectionManager()
     manager._sleep = _FakeSleep()
     owner = object()
@@ -1036,7 +1034,13 @@ async def test_configure_on_detached_interface_is_control_not_allowed(mocker):
     await manager.apply_configuration(
         other, _configs(wlanpi0={"channels": [{"freq": 5180, "width": 20}]})
     )
+    await manager.start_streaming(other, ["wlanpi0"], "")
 
+    applied = next(
+        c for c in send_event.await_args_list if c.args[2] == "CONFIG_APPLIED"
+    )
+    assert applied.args[3]["deferred"] == ["wlanpi0"]
+    assert manager.interface_owners["wlanpi0"] is owner
     err = next(
         c for c in send_event.await_args_list if c.args[2] == "CONTROL_NOT_ALLOWED"
     )
@@ -1073,10 +1077,11 @@ async def test_stop_session_by_id_from_same_did_stops_detached(mocker):
 
 
 @pytest.mark.asyncio
-async def test_broadcast_skips_detached_owner_but_queues_subscribers(mocker):
+async def test_broadcast_skips_detached_owner(mocker):
     manager = ConnectionManager()
     manager._sleep = _FakeSleep()
-    owner = object()
+    owner = mocker.Mock(spec=["send_bytes"])
+    owner.send_bytes = AsyncMock()
     subscriber = object()
     _connected_client(manager, owner)
     _connected_client(manager, subscriber)
@@ -1092,11 +1097,9 @@ async def test_broadcast_skips_detached_owner_but_queues_subscribers(mocker):
     manager.clients[owner]["subscribers"].add(subscriber)
     manager._cancel_orphan(manager.clients[owner])
 
-    # Minimal SHB+IDB so framing yields a block; use a tiny complete-looking chunk
-    # that _pcapng_blocks may buffer. Queue still receives whatever completes.
-    chunk = b"\x0a\x0d\x0d\x0a" + b"\x00" * 24
-    await manager._broadcast_chunk(owner, manager.clients[owner], chunk)
+    owner.send_bytes.reset_mock()
 
-    # Detached owner must not be asked to send_bytes (object has none).
-    assert manager.clients[owner]["owner_attached"] is False
+    await manager._broadcast_chunk(owner, manager.clients[owner], b"\x00" * 8)
+
+    owner.send_bytes.assert_not_awaited()
     await manager.stop_streaming(owner, notify=False, reason="OWNER_STOP")

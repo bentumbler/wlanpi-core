@@ -557,15 +557,14 @@ a `subscriber_count` — and ends when one of these happens first:
 | End | Reason on `CAPTURE_STOPPED` |
 |---|---|
 | the deadline is reached | `DURATION_ELAPSED` |
-| `{ "command": "stop", "session_id": "cap_…" }` from any connection authenticated as the owner's `did` | `OWNER_STOP` |
+| `{ "command": "stop", "session_id": "cap_…" }` from any connection authenticated as the owner's `did` (attached or not) | `OWNER_STOP` |
 | nobody has been attached (owner or subscriber) for a short grace period (15 s) | `NO_LISTENERS` |
 
-Detach is **listen/stop only**. There is no way to reclaim `configure` on a
-detached session. A reconnecting owner should `list_sessions`: if the session
+Detach is **listen/stop only**: nothing can retune a detached session. A reconnecting owner should `list_sessions`: if the session
 is still there, subscribe to listen or `stop` with its `session_id`. A bare
 `{"command": "stop"}` on that new connection is `STOP_REQUIRES_SESSION`
 (`data.sessions` lists the ids to use) and does **not** end the capture.
-Any `configure` or `start` that names an interface that session holds is
+A `start` that names an interface that session holds is
 `CONTROL_NOT_ALLOWED` (payload includes `session_id`, `owner_attached: false`,
 and `allowed`).
 
@@ -586,7 +585,7 @@ on single-radio devices the phy can be briefly busy while the managed interface
 scans), `SUBSCRIBED`, `SESSIONS`, `UNSUBSCRIBED`, `CONFIG_APPLIED`, `CONFIG_CHANGED`
 (sent to subscribers after a live retune), `CAPTURE_STOPPED` /
 `CAPTURE_ENDED` (with `data.reason`, see 11.2 and 11.5), and errors
-`INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED` (configure/start on an interface a
+`INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED` (start on an interface a
 detached session holds — listen or stop only), `INTERFACE_NOT_AVAILABLE`,
 `SESSION_NOT_FOUND`, `SESSION_NOT_OWNED`, `STOP_REQUIRES_SESSION` (bare `stop`
 on a socket with no attached capture; `data.sessions` lists ids this `did`
