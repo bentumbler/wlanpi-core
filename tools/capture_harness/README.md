@@ -143,3 +143,14 @@ Deliberately minimal: radiotap first-present-word fields (channel, signal, TX
 power) and the IEs SSID, DS channel, country, RSN/WPA, HT/VHT/HE/EHT presence,
 and TPC-report TX power. For full analysis, open the `--raw-out` pcapng in
 Wireshark.
+
+
+### Detach a bounded owner
+
+```bash
+./capture_harness.py run --config lab.json --duration 300 --detach
+```
+
+Starts a bounded capture then exits without `stop`. Subscribers (or a later
+`stop` with `session_id` from the same `did`) keep the session alive until the
+deadline or orphan grace.

@@ -41,7 +41,7 @@ timeout / a token in the URL). After that:
 | `get_supported_frequencies` | `{}` | channel list the device supports |
 | `configure` | `{"interfaces": {"wlanpi0": {"channels": [{"freq": 2412, "width": 20}], "dwell_time": 250}}}` | per-interface config; `width` ∈ {20,40,80,160}, `dwell_time` 50–60000 ms |
 | `start` | `{"interfaces": ["wlanpi0"], "pcap_filter": "", "duration_sec": 300}` | begins capture; interfaces must be configured first. `duration_sec` (1–3600) is optional: core stops the capture itself when it elapses; omit for a perpetual capture |
-| `stop` | `{}` | owner only |
+| `stop` | `{}` or `{"session_id": "cap_xxxx"}` | own capture; or a session owned by this `did` (how a detached capture is stopped from a new connection) |
 | `subscribe` | `{"session_id": "cap_xxxx"}` | listen read-only to another socket's capture |
 | `unsubscribe` | `{}` | detach |
 | `list_sessions` | `{}` | enumerate running captures **with their running config** and lifetime (`elapsed_sec`, `duration_sec`, `remaining_sec`) |
@@ -60,8 +60,11 @@ Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
   `data.interfaces`), `CHANNEL_SET` / `CHANNEL_SET_FAILED` (hop status; failure
   `data.message` carries the `iw` reason), `SUBSCRIBED`, `SESSIONS`
   (`data.sessions`), `CAPTURE_STOPPED` / `CAPTURE_ENDED` (`data.reason` ∈
-  `OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`, `PROCESS_EXITED`), and `error` events
-  (`AUTH_FAILED`, `INTERFACE_IN_USE`, `SESSION_NOT_FOUND`, `CONFIG_INVALID`, …).
+  `OWNER_STOP`, `OWNER_DISCONNECT`, `DURATION_ELAPSED`, `NO_LISTENERS`,
+  `PROCESS_EXITED`), and `error` events
+  (`AUTH_FAILED`, `INTERFACE_IN_USE`, `CONTROL_NOT_ALLOWED`,
+  `STOP_REQUIRES_SESSION`, `SESSION_NOT_FOUND`,
+  `CONFIG_INVALID`, …).
 
 ---
 
@@ -71,9 +74,11 @@ Interface names must match `wlanpiN` (the monitor-mode interface), not `wlan0`.
   each running capture to the owning socket; only that socket can
   `configure`/`stop` it. Any *other* authenticated connection may `subscribe`
   read-only (device-open reads — see Appendix A policy A).
-- **The capture lives with its owning socket.** If the socket closes, the
-  capture stops and subscribers are detached. There is no detached/durable
-  capture that outlives its connection.
+- **Perpetual captures live with the owning socket.** If that socket closes,
+  the capture stops. **Bounded captures** (`duration_sec`) may detach: the
+  session keeps running for subscribers until the deadline, an explicit
+  `stop` with `session_id` from the owner's `did`, or orphan grace with no
+  listeners. Detach is listen/stop only (no reclaim of `configure`).
 - **Revocation** stops new connections and new captures immediately, but does
   **not** tear down a socket that is already streaming (documented Prague
   semantic; see Appendix A decision 3).
