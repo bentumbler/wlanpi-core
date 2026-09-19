@@ -76,7 +76,6 @@ class ConnectionManager:
             "namespace": None,
             "subscribers": set(),
             "subscribed_to": None,
-            "session_end": None,
             "pcapng_buffer": bytearray(),
             "pcapng_header": bytearray(),
             "pcapng_endian": None,
@@ -258,7 +257,6 @@ class ConnectionManager:
         client["duration_sec"] = None
         client["stop_reason"] = None
         client["namespace"] = None
-        client["session_end"] = None
         if session_id:
             self.sessions.pop(session_id, None)
         client.setdefault("pcapng_buffer", bytearray()).clear()
@@ -898,7 +896,6 @@ class ConnectionManager:
         client["pcapng_header"].clear()
         client["pcapng_endian"] = None
         client["pcapng_header_complete"] = False
-        client["session_end"] = None
 
         for iface in interfaces:
             config = client["configs"].get(iface)
@@ -1074,7 +1071,6 @@ class ConnectionManager:
         message = _STOP_MESSAGES.get(reason, "Capture stopped.")
         if client.get("session_id"):
             client["stop_reason"] = reason
-            client["session_end"] = ("CAPTURE_STOPPED", message)
         if task:
             task.cancel()
 
