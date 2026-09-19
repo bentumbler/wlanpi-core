@@ -224,6 +224,29 @@ class ConnectionManager:
         client["pcapng_endian"] = None
         client["pcapng_header_complete"] = False
 
+        await self._notify_subscribers(
+            client,
+            session_id,
+            code,
+            {"message": message, "session_id": session_id},
+            final=True,
+        )
+
+    async def _notify_subscribers(
+        self,
+        client: dict[str, Any],
+        session_id: str | None,
+        code: str,
+        data: dict[str, Any],
+        final: bool = False,
+    ) -> None:
+        """Send a status event to every subscriber of a session.
+
+        Prefer the subscription queue so a slow subscriber cannot stall the
+        owner; one whose queue is full is dropped. Queue-less subscribers get a
+        bounded direct send. ``final`` also ends each subscription.
+        """
+        event_text = self._event_text("status", code, data)
         notification_targets = []
         for subscriber in list(client.get("subscribers", set())):
             sub_client = self.clients.get(subscriber)
@@ -233,30 +256,19 @@ class ConnectionManager:
                     notification_targets.append(subscriber)
                 else:
                     try:
-                        queue.put_nowait(
-                            (
-                                "event",
-                                self._event_text(
-                                    "status",
-                                    code,
-                                    {"message": message, "session_id": session_id},
-                                ),
-                            )
-                        )
-                        queue.put_nowait(("done", None))
+                        queue.put_nowait(("event", event_text))
+                        if final:
+                            queue.put_nowait(("done", None))
                     except asyncio.QueueFull:
                         self._close_subscription_queue(sub_client)
-            client["subscribers"].discard(subscriber)
+                        client["subscribers"].discard(subscriber)
+            if final:
+                client["subscribers"].discard(subscriber)
         if notification_targets:
             await asyncio.gather(
                 *(
                     asyncio.wait_for(
-                        self.send_event(
-                            subscriber,
-                            "status",
-                            code,
-                            {"message": message, "session_id": session_id},
-                        ),
+                        self.send_event(subscriber, "status", code, data),
                         timeout=_SUBSCRIBER_SEND_TIMEOUT_SEC,
                     )
                     for subscriber in notification_targets
@@ -544,43 +556,6 @@ class ConnectionManager:
             for iface in session_config["interfaces"]
         }
 
-    async def _notify_config_changed(
-        self, client: dict[str, Any], session_id: str, owner_ws: WebSocket
-    ) -> None:
-        """Tell subscribers the owner's channel plan changed.
-
-        Delivery mirrors ``_end_session``: prefer the subscription queue so a
-        slow subscriber cannot stall the owner's configure path. Queue-less
-        subscribers (legacy test wiring) fall back to a bounded send_event.
-        """
-        data = self._session_descriptor(session_id, owner_ws)
-        event_text = self._event_text("status", "CONFIG_CHANGED", data)
-        notification_targets = []
-        for subscriber in list(client.get("subscribers", set())):
-            sub_client = self.clients.get(subscriber)
-            if not sub_client or sub_client.get("subscribed_to") != session_id:
-                continue
-            queue = sub_client.get("subscription_queue")
-            if queue is None:
-                notification_targets.append(subscriber)
-                continue
-            try:
-                queue.put_nowait(("event", event_text))
-            except asyncio.QueueFull:
-                client["subscribers"].discard(subscriber)
-                self._close_subscription_queue(sub_client)
-        if notification_targets:
-            await asyncio.gather(
-                *(
-                    asyncio.wait_for(
-                        self.send_event(subscriber, "status", "CONFIG_CHANGED", data),
-                        timeout=_SUBSCRIBER_SEND_TIMEOUT_SEC,
-                    )
-                    for subscriber in notification_targets
-                ),
-                return_exceptions=True,
-            )
-
     async def apply_configuration(
         self, websocket: WebSocket, configs: dict[str, CaptureInterfaceConfig]
     ) -> None:
@@ -612,7 +587,12 @@ class ConnectionManager:
             self._refresh_session_config(client)
             session_id = client.get("session_id")
             if session_id:
-                await self._notify_config_changed(client, session_id, websocket)
+                await self._notify_subscribers(
+                    client,
+                    session_id,
+                    "CONFIG_CHANGED",
+                    self._session_descriptor(session_id, websocket),
+                )
 
         await self.send_event(
             websocket,
