@@ -551,7 +551,7 @@ async def test_set_channel_rejects_invalid_center_before_command(mocker):
     run_command.assert_not_awaited()
 
 
-# --- Session lifetime on the descriptor (P6.2) -----------------------------
+# --- Session lifetime on the descriptor -----------------------------------
 
 
 class _FakeClock:
