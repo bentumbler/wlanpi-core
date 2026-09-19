@@ -56,19 +56,6 @@ def validate_pcap_filter(value: str | None) -> str:
     return value
 
 
-def validate_capture_duration(value: int | None) -> int | None:
-    """Validate an optional bounded-capture duration in seconds."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("duration_sec must be an integer number of seconds")
-    if value < 1 or value > MAX_CAPTURE_DURATION_SEC:
-        raise ValueError(
-            f"duration_sec must be between 1 and {MAX_CAPTURE_DURATION_SEC}"
-        )
-    return value
-
-
 class CaptureChannel(BaseModel):
     """One capture channel with a frequency and width."""
 
@@ -134,7 +121,9 @@ class CaptureStart(BaseModel):
     pcap_filter: str = ""
     #: Seconds after which core stops the capture itself. None = perpetual
     #: (runs until the owner stops it or its socket closes), as before.
-    duration_sec: int | None = None
+    duration_sec: int | None = Field(
+        default=None, ge=1, le=MAX_CAPTURE_DURATION_SEC, strict=True
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -152,9 +141,3 @@ class CaptureStart(BaseModel):
     def validate_filter_field(cls, value: str | None) -> str:
         """Validate the pcap filter, defaulting to empty."""
         return validate_pcap_filter(value)
-
-    @field_validator("duration_sec", mode="before")
-    @classmethod
-    def validate_duration_field(cls, value: int | None) -> int | None:
-        """Validate an optional duration_sec on start."""
-        return validate_capture_duration(value)

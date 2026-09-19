@@ -59,7 +59,6 @@ def _connected_client(manager, websocket):
         "duration_sec": None,
         "deadline_task": None,
         "stop_reason": None,
-        "session_end": None,
         "pcapng_buffer": bytearray(),
         "pcapng_header": bytearray(),
         "pcapng_endian": None,
@@ -201,7 +200,11 @@ async def test_capture_process_is_isolated_and_reaped_on_stop(mocker):
         listener,
         "status",
         "CAPTURE_STOPPED",
-        {"message": "Capture stopped.", "session_id": session_id},
+        {
+            "message": "Capture stopped.",
+            "session_id": session_id,
+            "reason": "OWNER_STOP",
+        },
     )
 
 
@@ -652,7 +655,7 @@ async def test_session_list_and_subscribed_carry_lifetime_fields(mocker):
     await manager.stop_streaming(owner, notify=False)
 
 
-# --- Bounded captures: duration_sec on start (P6.3) -------------------------
+# --- Bounded captures: duration_sec on start --------------------------------
 
 
 class _FakeSleep:
