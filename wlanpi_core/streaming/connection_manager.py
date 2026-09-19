@@ -254,7 +254,8 @@ class ConnectionManager:
         stop that session first; anyone may subscribe to it.
         """
         for iface in interfaces:
-            holder = self.clients.get(self.interface_owners.get(iface)) or {}
+            owner_ws = self.interface_owners.get(iface)
+            holder = self.clients.get(owner_ws, {}) if owner_ws else {}
             session_id = holder.get("session_id")
             if session_id and not holder.get("owner_attached", True):
                 break
