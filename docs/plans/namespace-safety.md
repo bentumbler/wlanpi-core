@@ -15,8 +15,13 @@ branch only. Drop it (or trim it) before the per-PR branches go upstream.
   Build with `dpkg-buildpackage -us -uc -b` and install the `.deb`.
 - Gates on every commit: `tox -e lint && tox -e formatcheck && tox -e py313`.
 
-Baseline on the branch: namespace + P0 matrices give `9 failed, 76 passed,
-20 skipped`; the 9 failures are the identity rows listed in #265.
+Baseline on the branch before Phase 0: namespace + P0 matrices gave
+`9 failed, 76 passed, 20 skipped`; the 9 failures are the identity rows listed
+in #265.
+
+After Phase 0: `78 passed, 20 skipped, 13 xfailed`. The 13 are the 9 original
+identity rows plus 4 new #236 rows, each listed in a `KNOWN_BUGS` dict in the
+matrix `test_matrix.py`.
 
 ## Phases
 
@@ -53,7 +58,7 @@ fail on a correct cross-netns fix.
 
 | PR | Scope | Clears |
 |---|---|---|
-| P1 #236 | Read-only cross-netns inventory helper in `adapters/discovery.py` (`{iface: (phy, netns)}`; not in `network_config`, which would be a circular import). Use it in the `activate_config`, `deactivate_config` and `revert_to_root(cfg)` gates (all root-only today, so rollback of namespaced configs is a no-op) and in `_prepare_root` / `_prepare_namespace`. Resolve before any delete. Fix `phy not in stdout` substring match. Look up both `interface` and `iface_display_name`. Address phys by index (`iw phy#N`). | 4 xfails |
+| P1 #236 | Read-only cross-netns inventory helper in `adapters/discovery.py` (`{iface: (phy, netns)}`; not in `network_config`, which would be a circular import). Use it in the `activate_config`, `deactivate_config` and `revert_to_root(cfg)` gates (all root-only today, so rollback of namespaced configs is a no-op) and in `_prepare_root` / `_prepare_namespace`. Resolve before any delete. Fix `phy not in stdout` substring match. Look up both `interface` and `iface_display_name`. Address phys by index (`iw phy#N`). | 8 xfails |
 | P2 #202 | `get_default_config` from the helper; no fake WPA2 without psk. Note the boot-time snapshot limit with a `# shortcut:` comment, or regenerate while unedited. | 3 xfails |
 
 ### Phase 2: correct teardown (internal only)
