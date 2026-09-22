@@ -18,6 +18,9 @@ _MAX_CAPTURE_CHANNELS = 128
 _MIN_DWELL_TIME_MS = 50
 _MAX_DWELL_TIME_MS = 60_000
 _MAX_PCAP_FILTER_BYTES = 1024
+#: Longest bounded capture. Omitting duration_sec keeps a capture perpetual;
+#: the cap bounds the radio hold when the owner never comes back for it.
+MAX_CAPTURE_DURATION_SEC = 3600
 
 
 def validate_capture_interface(value: str) -> str:
@@ -116,6 +119,11 @@ class CaptureStart(BaseModel):
         max_length=_MAX_CAPTURE_INTERFACES,
     )
     pcap_filter: str = ""
+    #: Seconds after which core stops the capture itself. None = perpetual
+    #: (runs until the owner stops it or its socket closes), as before.
+    duration_sec: int | None = Field(
+        default=None, ge=1, le=MAX_CAPTURE_DURATION_SEC, strict=True
+    )
 
     model_config = {"extra": "forbid"}
 
