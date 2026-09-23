@@ -215,15 +215,12 @@ def hardware_success_mocks(interfaces=None, phy_move_side_effect=None):
                 raise RunCommandError("phy move failed", 1)
         return None
 
-    def _find_interface(names, prefer_netns=None):
+    def _live(name):
         # Parity layout: wlanN lives on phyN in root.
-        for name in names:
-            if name in interfaces:
-                index = interfaces.index(name)
-                if name.removeprefix("wlan").isdigit():
-                    index = int(name.removeprefix("wlan"))
-                return LiveInterface(name, index, None, "managed")
-        return None
+        index = interfaces.index(name)
+        if name.removeprefix("wlan").isdigit():
+            index = int(name.removeprefix("wlan"))
+        return LiveInterface(name, index, None, "managed")
 
     patches = [
         patch(
@@ -231,12 +228,8 @@ def hardware_success_mocks(interfaces=None, phy_move_side_effect=None):
             return_value=interfaces,
         ),
         patch(
-            "wlanpi_core.services.network_namespace_service.discovery.find_interface",
-            side_effect=_find_interface,
-        ),
-        patch(
             "wlanpi_core.adapters.discovery.list_interfaces_all_namespaces",
-            return_value=[_find_interface([name]) for name in interfaces],
+            return_value=[_live(name) for name in interfaces],
         ),
         patch(
             "wlanpi_core.services.network_namespace_service.ns_namespace.namespace_exists",

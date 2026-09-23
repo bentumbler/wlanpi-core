@@ -650,12 +650,32 @@ class NetworkNamespaceService:
     def _find_live(
         self, cfg: NamespaceConfig | RootConfig
     ) -> discovery.LiveInterface | None:
-        """Find cfg's netdev in any netns, by iface_display_name then interface."""
-        names = [n for n in (cfg.iface_display_name, cfg.interface) if n]
-        if not names:
-            return None
+        """Find the live netdev backing cfg, in any namespace.
+
+        `interface` names the radio wherever it is. `iface_display_name` is
+        what Core renames it to, so it only identifies cfg's radio inside
+        cfg's own target namespace; another entry may use the same display
+        name in a different namespace.
+        """
         namespace = cfg.namespace if isinstance(cfg, NamespaceConfig) else None
-        return discovery.find_interface(names, prefer_netns=namespace)
+        inventory = discovery.list_interfaces_all_namespaces()
+        display = cfg.iface_display_name
+        if display and display != cfg.interface:
+            for live in inventory:
+                if live.name == display and live.netns == namespace:
+                    return live
+        if not cfg.interface:
+            return None
+        matches = sorted(
+            (live for live in inventory if live.name == cfg.interface),
+            key=lambda live: (live.netns != namespace, live.netns is not None),
+        )
+        if len(matches) > 1:
+            self.log.warning(
+                f"Interface {cfg.interface} exists in several namespaces "
+                f"{[m.netns or 'root' for m in matches]}; using {matches[0].netns or 'root'}"
+            )
+        return matches[0] if matches else None
 
     def _mode_value(self, cfg: NamespaceConfig | RootConfig) -> str:
         return (
