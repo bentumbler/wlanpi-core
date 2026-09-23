@@ -185,6 +185,20 @@ class ConnectionMonitor:
                     f"in {namespace_display} (elapsed={elapsed}s, checks={poll_count}). "
                     f"Configuration remains active for future connection."
                 )
+                if stop_event.is_set():
+                    return
+                # Leave dhcpcd waiting in the background: it follows the link
+                # and leases when a late association completes (a Wi-Fi 7
+                # radio scanning 2.4/5/6 GHz can take longer than `timeout`).
+                # The app still waits for a confirmed connection.
+                try:
+                    restart_dhcp_with_timeout(
+                        iface, namespace, timeout=1, default_route=cfg.default_route
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"[ConnectionMonitor] Could not leave DHCP running for {iface}: {e}"
+                    )
 
         # Create and start monitor thread
         log.info(

@@ -974,7 +974,9 @@ def handle_ssid_delayed_beyond_monitor_timeout(
     # One poll per fake second for 15 s proves the timeout path ran, not the
     # stop-event path.
     assert wpa.call_count == 15
-    dhcp.assert_not_called()
+    # dhcpcd is left waiting in the background for a late association; the
+    # app still needs a confirmed connection.
+    dhcp.assert_called_once_with("wlan0", None, timeout=1, default_route=False)
     start_app.assert_not_called()
 
 
@@ -1678,8 +1680,16 @@ def handle_monitor_restart_keeps_new_generation(
         assert release.wait(timeout=10), "test never released the status call"
         return {"wpa_status": {"wpa_state": "SCANNING"}}
 
+    dhcp_threads: list[threading.Thread] = []
+
+    def record_dhcp(*args, **kwargs):
+        dhcp_threads.append(threading.current_thread())
+
     with patch("wlanpi_core.connection.monitor.get_wpa_status", side_effect=wpa_status):
-        with patch("wlanpi_core.connection.monitor.restart_dhcp_with_timeout") as dhcp:
+        with patch(
+            "wlanpi_core.connection.monitor.restart_dhcp_with_timeout",
+            side_effect=record_dhcp,
+        ):
             with _patch_monitor_clock():
                 try:
                     ConnectionMonitor.start_monitor(cfg, "wlan0", None, timeout=15)
@@ -1700,7 +1710,8 @@ def handle_monitor_restart_keeps_new_generation(
                     assert mon._connection_monitors.get("root:wlan0") is second
                 stop_all_connection_monitors()
                 _wait_for_monitors_idle()
-    dhcp.assert_not_called()
+    # The superseded monitor must never reach DHCP; only the live one may.
+    assert first not in dhcp_threads
 
 
 def handle_monitor_stop_during_poll_skips_dhcp(
