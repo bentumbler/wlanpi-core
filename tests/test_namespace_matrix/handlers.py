@@ -88,6 +88,15 @@ SHARED_PHY_THREE_RADIO: dict[str, dict[str, str]] = {
 }
 
 
+def _mark_core_namespace(name: str) -> None:
+    """Record `name` as created by Core, as _prepare_namespace would."""
+    from wlanpi_core.services import network_namespace_service as nns
+
+    marker = Path(nns.RUN_DIR) / "netns" / name
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
 class _MonitorClock:
     """Fake `time` for connection.monitor only; sleep advances the clock.
 
@@ -1183,7 +1192,7 @@ def handle_create_profile_snapshots_mac(
 def handle_iface_already_in_netns_at_activation(
     namespace_service, netcfg_env, scenario: Scenario
 ):
-    """#236: a root cfg for an iface left in another netns brings it home."""
+    """#236: a root cfg for an iface left in a Core netns brings it home."""
     adapters = {
         **JOSH_THREE_RADIO,
         "wlan1": {**JOSH_THREE_RADIO["wlan1"], "netns": "old_ns"},
@@ -1193,13 +1202,17 @@ def handle_iface_already_in_netns_at_activation(
         "home_cfg",
         roots=[_root(interface="wlan1", phy="phy2").model_dump(mode="json")],
     )
+    _mark_core_namespace("old_ns")  # left behind by an earlier Core activation
     with live_adapter_inventory_mocks(adapters) as inventory:
         ok = nc.activate_config("home_cfg", override_active=True)
     assert ok is True
-    assert inventory.deleted == [("wlan1", "old_ns")]
+    # Tearing down the active default (#271) brings wlan1 home from the
+    # leftover Core namespace; the new profile's prepare then recreates it.
+    assert inventory.deleted == [("wlan1", "old_ns"), ("wlan1", None)]
     assert inventory.phy_moves == [("phy2", None)]
-    assert inventory.adds == [("phy2", "wlan1", None)]
+    assert inventory.adds == [("phy2", "wlan1", None), ("phy2", "wlan1", None)]
     assert inventory.live() == JOSH_LIVE
+    assert "old_ns" not in inventory.netns
 
 
 def handle_phy10_vs_phy1_substring(namespace_service, netcfg_env, scenario: Scenario):
@@ -1214,12 +1227,16 @@ def handle_phy10_vs_phy1_substring(namespace_service, netcfg_env, scenario: Scen
         "phy1_cfg",
         roots=[_root(interface="wlan1", phy="phy1").model_dump(mode="json")],
     )
+    _mark_core_namespace("old_ns")
     with live_adapter_inventory_mocks(adapters) as inventory:
         ok = nc.activate_config("phy1_cfg", override_active=True)
     assert ok is True
-    assert inventory.deleted == [("wlan1", "old_ns")]
+    # As in iface_already_in_netns_at_activation: default teardown returns
+    # phy1 from the leftover Core namespace, then prepare recreates wlan1.
+    assert inventory.deleted == [("wlan1", "old_ns"), ("wlan1", None)]
     assert inventory.phy_moves == [("phy1", None)]
-    assert inventory.adds == [("phy1", "wlan1", None)]
+    assert inventory.adds == [("phy1", "wlan1", None), ("phy1", "wlan1", None)]
+    assert "old_ns" not in inventory.netns
     assert inventory.live() == {
         "wlan0": ("phy0", None, "managed"),
         "wlan1": ("phy1", None, "managed"),
@@ -1583,6 +1600,27 @@ def handle_deactivate_applies_default(
     assert inventory.live() == JOSH_LIVE
 
 
+def handle_profile_skips_foreign_namespace_radio(
+    namespace_service, netcfg_env, scenario: Scenario
+):
+    """Skip a radio in a namespace Core did not create; it is someone else's."""
+    adapters = {
+        **JOSH_THREE_RADIO,
+        "wlan2": {**JOSH_THREE_RADIO["wlan2"], "netns": "user_ns"},
+    }
+    _write_netconfig(
+        netcfg_env,
+        "want_wlan2",
+        roots=[_root(interface="wlan2", phy="phy1").model_dump(mode="json")],
+    )
+    with live_adapter_inventory_mocks(adapters) as inventory:
+        assert nc.activate_config("want_wlan2", override_active=True) is True
+        assert nc.deactivate_config("want_wlan2") is True
+    assert inventory.live()["wlan2"] == ("phy1", "user_ns", "managed")
+    assert inventory.phy_moves == []
+    assert inventory.netns == {"user_ns"}
+
+
 def handle_rollback_after_partial_prepare(
     namespace_service, netcfg_env, scenario: Scenario
 ):
@@ -1664,6 +1702,7 @@ HANDLERS = {
     "rollback_after_partial_prepare": handle_rollback_after_partial_prepare,
     "concurrent_activate_rejected": handle_concurrent_activate_rejected,
     "override_tears_down_previous": handle_override_tears_down_previous,
+    "profile_skips_foreign_namespace_radio": handle_profile_skips_foreign_namespace_radio,
     "failed_override_falls_back_to_default": handle_failed_override_falls_back_to_default,
     "deactivate_applies_default": handle_deactivate_applies_default,
     "validate_duplicate_interface": handle_validate_duplicate_interface,
