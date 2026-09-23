@@ -23,7 +23,48 @@ After Phase 0: `78 passed, 20 skipped, 13 xfailed`. The 13 are the 9 original
 identity rows plus 4 new #236 rows, each listed in a `KNOWN_BUGS` dict in the
 matrix `test_matrix.py`.
 
-## Phases
+## Status (2026-09-23)
+
+All planned PRs are implemented, gated, and hardware-verified on a Trixie
+WLAN Pi (ath12k PCIe + 2x MT7921AU USB, iw 6.17, wpa_supplicant 2.12,
+dhcpcd 10.1), and open upstream as stacked **draft** PRs against `dev`.
+Each branch `bentumbler:ns-safety/pN-*` is cut from `dev` plus #265's
+commit plus the series so far, without this plan doc, and passes
+`tox -e lint`, `tox -e formatcheck` and `tox` on its own. The hardware
+suite (installed .deb driven through the local API) ends at 127/127.
+
+| PR | Branch | Upstream | Version |
+|---|---|---|---|
+| P0 tests (#265 follow-up) | p0-trustworthy-tests | #280 | none |
+| P1 #236 live inventory | p1-live-inventory | #281 | 2.3.8 |
+| P2 #202 live default | p2-live-default | #282 | 2.3.9 |
+| P3 #269 supplicant pidfiles | p3-supplicant-pidfiles | #283 | 2.3.10 |
+| P4 #275 Core namespaces | p4-core-namespaces | #284 | 2.3.11 |
+| P5 #273 runtime state | p5-runtime-state | #285 | 2.3.12 |
+| P6 #270 change lock | p6-change-lock | #286 | 2.3.13 |
+| P7 #271 profile teardown | p7-profile-teardown | #289 | 2.3.14 |
+| P8 #277 atomic writes | p8-atomic-writes | #290 | 2.3.15 |
+| P9 #279 + #261 DHCP | p9-dhcpcd-monitor | #291 | 2.3.16 |
+| P10 #278 wpa quoting | p10-wpa-quoting | #295 | 2.3.17 |
+| P10b #236 radio lookup | p10b-radio-lookup | #296 | 2.3.18 |
+| P11 #272 secrets | p11-secrets | #297 | 2.3.19 |
+| P12 #276 outcomes | p12-activation-outcomes | #298 | 2.3.20 |
+| P13 #274 wlan/revert | p13-wlan-revert | #299 | 2.3.21 |
+
+Found on hardware and fixed in the series: dhclient missing on Trixie
+(dhcpcd per namespace, P9); dhcpcd state collides across netns (P9); a
+late ath12k association never got DHCP (P9); a display name reused across
+namespaces grabbed the wrong radio (P5); default teardown took a radio from
+a user's namespace (P7); a display name carried by another radio selected
+it, and a failed rename deleted it (P10b); wpa_supplicant does not
+unescape quoted values and rejects `psk=P"..."` (P10).
+
+Open follow-ups: #237 MAC pin (last 2 xfails; also closes the
+hot-plugged-adapter name-reuse gap noted in P10b); `network_service.renew_dhcp`
+(legacy D-Bus path) still calls dhclient; `namespaces/apps.py` falls back to
+`pkill -f <app>` when an app pidfile has no PID; `default.json` is a
+snapshot of the radios at creation (`# shortcut:` in P2).
+
 
 ### Phase 0: make the tests trustworthy (tests only, no changelog bump)
 
