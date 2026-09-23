@@ -36,6 +36,16 @@ green on every branch (tip 694 passed); HIL 163/163 on the tip .deb;
 manual scenario script `/home/wlanpi/ns-manual-tests.sh` (auto set 43/43).
 Deferred: #292, #293 skip-recreate, #294, #237.
 
+**In-use rule (2026-09-23, on #301):** Core never takes a radio another tool
+is using (mode Core never sets, a foreign wpa_supplicant/hostapd, or a
+program capturing on a sibling netdev via a bound packet socket); the entry
+is `in_use`, the rest of the profile runs, and teardown leaves it alone.
+Ownership is keyed on the cfg80211 wdev id (ifindex changes across netns
+moves) and is handed back on revert. Found and verified with the real
+wlanpi-profiler (fakeap; its hostapd mode fails on mt76/ath12k, a profiler
+2.1.3 bug). Tip `9ee9ce0`: 708 passed; HIL 163/163; manual 43/43;
+profiler 34/34.
+
 
 All planned PRs are implemented, gated, and hardware-verified on a Trixie
 WLAN Pi (ath12k PCIe + 2x MT7921AU USB, iw 6.17, wpa_supplicant 2.12,

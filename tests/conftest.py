@@ -200,6 +200,9 @@ def _service_side_effect_patches() -> list[Any]:
             NetworkNamespaceService,
             "_monitor_connection_async",
         ),
+        # No real /proc scan: rows that need a foreign supplicant or hostapd
+        # patch this themselves.
+        patch("wlanpi_core.adapters.usage.foreign_users", return_value=[]),
         patch(
             "wlanpi_core.services.network_namespace_service.apps.start_app_in_namespace",
             return_value=True,
@@ -307,8 +310,15 @@ class Iface:
     phy: str
     netns: str | None = None
     type: str = "managed"
-    # Kernel ifindex: survives a netns move; newer netdevs get higher ones.
+    # Kernel ifindex, per netns: a netns move gives a new one here (the worst
+    # case on a real kernel, which keeps it only if it is free in the target).
     ifindex: int = 0
+    # cfg80211 wdev id: survives netns moves; newer netdevs get higher ones.
+    wdev: int = 0
+    # Administratively up (`ip link set <iface> up`); new netdevs start down.
+    up: bool = False
+    # A program has a packet socket bound to it (capturing, e.g. profiler).
+    bound: bool = False
 
 
 @dataclass
@@ -338,6 +348,7 @@ class InventoryRecorder:
     commands: list[tuple[str | None, list[str]]] = field(default_factory=list)
     unrecognised: list[tuple[str | None, list[str]]] = field(default_factory=list)
     next_ifindex: int = 3
+    next_wdev: int = 3
     # netns name -> identity; a namespace deleted and re-added gets a new one,
     # like the nsfs inode under /run/netns.
     netns_ids: dict[str, int] = field(default_factory=dict)
@@ -362,6 +373,9 @@ class InventoryRecorder:
                 netns=netns,
                 type=meta.get("type", "managed"),
                 ifindex=ifindex,
+                wdev=ifindex,
+                up=bool(meta.get("up")),
+                bound=bool(meta.get("bound")),
             )
         netns_set = {ns for ns in phy_netns.values() if ns is not None}
         return cls(
@@ -371,6 +385,7 @@ class InventoryRecorder:
             netns=netns_set,
             faults=dict(faults or {}),
             next_ifindex=3 + len(adapters),
+            next_wdev=3 + len(adapters),
             netns_ids={name: 900 + i for i, name in enumerate(sorted(netns_set))},
         )
 
@@ -423,6 +438,14 @@ class InventoryRecorder:
             return self._iw(netns, parts[1:], raise_on_fail)
         if parts[:1] == ["ip"]:
             return self._ip(netns, parts[1:], raise_on_fail)
+        if parts == ["cat", "/proc/net/packet"]:
+            # One packet socket per netdev a program is capturing on.
+            rows = "".join(
+                f"00000000 3 3 0003 {meta.ifindex} 1 0 0 {9000 + meta.ifindex}\n"
+                for _name, meta in self._netns_ifaces(netns)
+                if meta.bound
+            )
+            return self._ok("sk RefCnt Type Proto Iface R Rmem User Inode\n" + rows)
         if parts[:1] and parts[0] in _NOOP_COMMANDS:
             return self._ok()
         return self._unrecognised(netns, parts)
@@ -452,7 +475,7 @@ class InventoryRecorder:
     def _netns_ifaces(self, netns: str | None) -> list[tuple[str, Iface]]:
         return sorted(
             ((name, meta) for (ns, name), meta in self.ifaces.items() if ns == netns),
-            key=lambda item: item[1].ifindex,
+            key=lambda item: item[1].wdev,
         )
 
     def _iw(
@@ -525,9 +548,14 @@ class InventoryRecorder:
                     raise_on_fail,
                 )
             self.ifaces[(netns, name)] = Iface(
-                phy=phy_name, netns=netns, type=iface_type, ifindex=self.next_ifindex
+                phy=phy_name,
+                netns=netns,
+                type=iface_type,
+                ifindex=self.next_ifindex,
+                wdev=self.next_wdev,
             )
             self.next_ifindex += 1
+            self.next_wdev += 1
             self.adds.append((phy_name, name, netns))
             return self._ok()
         if rest[:2] == ["set", "netns"]:
@@ -547,15 +575,22 @@ class InventoryRecorder:
             return self._ok()
         return self._unrecognised(netns, ["iw", "phy", phy_name, *rest])
 
+    @staticmethod
+    def _wdev_id(meta: Iface) -> int:
+        # Like cfg80211: wiphy index in the high 32 bits.
+        return (int(meta.phy.removeprefix("phy")) << 32) | meta.wdev
+
     def _move_phy(self, phy_name: str, target: str | None) -> None:
         source = self.phy_netns[phy_name]
         travelling = sorted(
             (key for key, meta in self.ifaces.items() if meta.phy == phy_name),
-            key=lambda key: self.ifaces[key].ifindex,
+            key=lambda key: self.ifaces[key].wdev,
         )
         for key in travelling:
             meta = self.ifaces.pop(key)
             meta.netns = target
+            meta.ifindex = self.next_ifindex
+            self.next_ifindex += 1
             name = key[1]
             if (target, name) in self.ifaces:
                 # The kernel does not refuse the move; it renames the
@@ -586,6 +621,7 @@ class InventoryRecorder:
                 lines += [
                     f"\tInterface {name}",
                     f"\t\tifindex {meta.ifindex}",
+                    f"\t\twdev 0x{self._wdev_id(meta):x}",
                     f"\t\taddr {self.phy_mac[phy_name]}",
                     f"\t\ttype {meta.type}",
                 ]
@@ -595,6 +631,7 @@ class InventoryRecorder:
         return (
             f"Interface {name}\n"
             f"\tifindex {meta.ifindex}\n"
+            f"\twdev 0x{self._wdev_id(meta):x}\n"
             f"\taddr {self.phy_mac[meta.phy]}\n"
             f"\ttype {meta.type}\n"
             f"\twiphy {meta.phy.removeprefix('phy')}\n"
@@ -606,14 +643,15 @@ class InventoryRecorder:
         if netns is None and args[:1] == ["netns"]:
             return self._ip_netns(args[1:], raise_on_fail)
         if args == ["-o", "link", "show"]:
-            stdout = "1: lo: <LOOPBACK> mtu 65536\n" + "".join(
-                f"{meta.ifindex}: {name}: <BROADCAST,MULTICAST> mtu 1500\n"
+            stdout = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n" + "".join(
+                f"{meta.ifindex}: {name}: <BROADCAST,MULTICAST{',UP' if meta.up else ''}> mtu 1500\n"
                 for name, meta in self._netns_ifaces(netns)
             )
             return self._ok(stdout)
         if len(args) == 4 and args[:2] == ["link", "set"] and args[3] in {"up", "down"}:
             if (netns, args[2]) not in self.ifaces:
                 return self._fail(f'Cannot find device "{args[2]}"\n', 1, raise_on_fail)
+            self.ifaces[(netns, args[2])].up = args[3] == "up"
             return self._ok()
         if args[:4] == ["-4", "route", "show", "default"]:
             # No DHCP server is modelled, so no interface has a gateway.

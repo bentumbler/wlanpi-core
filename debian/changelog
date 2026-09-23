@@ -13,14 +13,23 @@ wlanpi-core (2.3.23-1) unstable; urgency=medium
 
 wlanpi-core (2.3.22-1) unstable; urgency=medium
 
-  * Track the interfaces Core creates (by namespace, name and ifindex, on
-    tmpfs) and make the default configuration touch only those and radios
-    in namespaces Core created. Interfaces from drivers or other tools, such
-    as wlanpi-profiler's hostapd, are left alone and reported as skipped;
-    after a reboot the default is a no-op (#202).
+  * Track the interfaces Core creates (by name and cfg80211 wdev id, which
+    survives netns moves, on tmpfs) and make the default configuration touch
+    only those and radios in namespaces Core created. Interfaces from
+    drivers or other tools, such as wlanpi-profiler's hostapd, are left
+    alone and reported as skipped; after a reboot the default is a no-op
+    (#202).
   * Deactivate restores its own root entries (the interface name, managed)
     instead of applying the default afterwards, and a failed activation only
     records default (#288, #271).
+  * Never take a radio another tool is using: one in a mode Core never sets
+    (e.g. AP), with a wpa_supplicant or hostapd Core did not start, or with
+    a program capturing on another interface of the same radio
+    (wlanpi-profiler's monitor, kismet, tcpdump). Its entry is reported
+    in_use with the reason and the rest of
+    the configuration still runs; teardown leaves it alone too.
+  * Interfaces a deactivate restores are handed back: Core only owns what
+    the active profile uses, so a later default never resets them.
   * A revert step that fails is reported instead of leaving a radio without
     an interface, and a failure after prepare (e.g. wpa_supplicant not
     starting) puts that entry back.
