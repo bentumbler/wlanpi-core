@@ -174,18 +174,20 @@ def list_interfaces_all_namespaces() -> list[LiveInterface]:
     return found
 
 
-def find_interface(names: list[str]) -> LiveInterface | None:
+def find_interface(
+    names: list[str], prefer_netns: str | None = None
+) -> LiveInterface | None:
     """
     Find the first of `names` that exists as a wireless netdev in any netns.
 
-    Names are tried in order. If one name exists in several namespaces, the
-    root namespace wins and a warning is logged.
+    Names are tried in order. If one name exists in several namespaces,
+    `prefer_netns` wins, then the root namespace, and a warning is logged.
     """
     inventory = list_interfaces_all_namespaces()
     for name in names:
         matches = sorted(
             (live for live in inventory if live.name == name),
-            key=lambda live: live.netns is not None,
+            key=lambda live: (live.netns != prefer_netns, live.netns is not None),
         )
         if len(matches) > 1:
             log.warning(

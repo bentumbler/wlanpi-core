@@ -113,12 +113,16 @@ def _isolate_namespace_execution(mock_namespace_execution):
 
 @pytest.fixture(autouse=True)
 def _isolate_run_dir(tmp_path, monkeypatch):
-    """Keep pidfiles and namespace markers out of the real /run/wlanpi-core."""
+    """Keep pidfiles, namespace markers and /etc/netns out of the real system."""
     run_dir = tmp_path / "run-wlanpi-core"
     monkeypatch.setattr(
         "wlanpi_core.services.network_namespace_service.RUN_DIR", str(run_dir)
     )
     monkeypatch.setattr("wlanpi_core.wpa.supplicant.RUN_DIR", str(run_dir))
+    monkeypatch.setattr(
+        "wlanpi_core.services.network_namespace_service.NETNS_ETC_DIR",
+        str(tmp_path / "etc-netns"),
+    )
     return run_dir
 
 
@@ -171,9 +175,6 @@ def _service_side_effect_patches() -> list[Any]:
             "wlanpi_core.services.network_namespace_service.wpa_config.write_wpa_config",
         ),
         patch(
-            "wlanpi_core.services.network_namespace_service.write_dhcp_config",
-        ),
-        patch(
             "wlanpi_core.services.network_namespace_service.wpa_supplicant.start_or_restart_supplicant",
         ),
         patch(
@@ -214,7 +215,7 @@ def hardware_success_mocks(interfaces=None, phy_move_side_effect=None):
                 raise RunCommandError("phy move failed", 1)
         return None
 
-    def _find_interface(names):
+    def _find_interface(names, prefer_netns=None):
         # Parity layout: wlanN lives on phyN in root.
         for name in names:
             if name in interfaces:
