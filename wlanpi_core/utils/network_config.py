@@ -25,7 +25,9 @@ from wlanpi_core.models.runcommand_error import RunCommandError
 from wlanpi_core.models.validation_error import ValidationError
 from wlanpi_core.schemas.network.network import (
     AdapterOutcome,
+    LeftAlone,
     NamespaceConfig,
+    NamespaceResetResult,
     NetConfig,
     NetConfigUpdate,
     NetSecurity,
@@ -53,6 +55,12 @@ def network_change_lock() -> Iterator[None]:
     opens its own file description) and other processes, such as an old
     gunicorn worker still finishing during a reload. Does not wait.
 
+    Not reentrant: acquiring it again while held, even in the same thread,
+    raises ConfigBusyError. Code already holding it (activate's rollback)
+    must call the unlocked service methods, not deactivate_config(). The
+    lock does not cover ConnectionMonitor threads, which run DHCP, routes
+    and app start after the change that started them has returned.
+
     Raises:
         ConfigBusyError: If another activate, deactivate or revert is running
     """
@@ -71,14 +79,15 @@ def network_change_lock() -> Iterator[None]:
         os.close(fd)
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     """Replace `path` with `text` so readers never see a partial file.
 
-    Writes a sibling temp file (created 0600, since profiles hold PSKs),
-    fsyncs it, then renames it over `path`.
+    Writes a sibling temp file with `mode` (0600 by default, since profiles
+    hold PSKs), fsyncs it, then renames it over `path`.
     """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w") as f:
             f.write(text)
             f.flush()
@@ -89,9 +98,14 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def _write_current(cfg_id: str) -> None:
+    # current.txt holds no secret and may be read by other wlanpi tools.
+    _atomic_write(ccf, cfg_id, mode=0o644)
+
+
 # IDs that clash with the built-in default, the root namespace or the
 # /network/config/status route, in any letter case.
-_RESERVED_IDS = {"default", "root", "status"}
+_RESERVED_IDS = {"default", "root", "status", "leftovers", "reset"}
 
 
 def _reject_reserved_id(cfg_id: str) -> None:
@@ -106,7 +120,13 @@ def _config_path(cfg_id: str) -> Path:
         validated_id = validate_config_id(cfg_id)
     except ValueError as error:
         raise ValidationError(str(error), status_code=400) from error
-    return cfg_dir / f"{validated_id}.json"
+    # validate_config_id already forbids "/", "." and ".."; this normpath +
+    # prefix check is the confinement CodeQL's py/path-injection recognises.
+    base = os.path.normpath(cfg_dir)
+    path = os.path.normpath(os.path.join(base, f"{validated_id}.json"))
+    if not path.startswith(base + os.sep):
+        raise ValidationError("Invalid configuration ID", status_code=400)
+    return Path(path)
 
 
 def _legacy_default_config(cfg_id: str = "default") -> NetConfig:
@@ -154,24 +174,35 @@ def get_default_config(cfg_id: str = "default") -> NetConfig:
     not create: the default must not claim a user's or another tool's radio.
     """
     core_namespaces = set(ns.core_namespaces())
-    roots = [
-        RootConfig(
-            mode=(
-                NetworkModeEnum.monitor
-                if live.type == "monitor"
-                else NetworkModeEnum.managed
-            ),
-            iface_display_name=live.name,
-            phy=f"phy{live.phy_index}",
-            interface=live.name,
-            security=None,
-            default_route=False,
-            autostart_app=None,
+    roots: list[RootConfig] = []
+    for live in discovery.list_interfaces_all_namespaces():
+        if live.netns is not None and live.netns not in core_namespaces:
+            continue
+        if live.type == "monitor" and _is_system_monitor(live.name):
+            continue
+        if any(r.interface == live.name for r in roots):
+            # The same name in root and a Core namespace is legal, but one
+            # NetConfig cannot hold both; root is listed first and wins.
+            log.warning(
+                f"{live.name} exists in more than one namespace; leaving the "
+                f"{live.netns or 'root'} one out of the default"
+            )
+            continue
+        roots.append(
+            RootConfig(
+                mode=(
+                    NetworkModeEnum.monitor
+                    if live.type == "monitor"
+                    else NetworkModeEnum.managed
+                ),
+                iface_display_name=live.name,
+                phy=f"phy{live.phy_index}",
+                interface=live.name,
+                security=None,
+                default_route=False,
+                autostart_app=None,
+            )
         )
-        for live in discovery.list_interfaces_all_namespaces()
-        if (live.netns is None or live.netns in core_namespaces)
-        and not (live.type == "monitor" and _is_system_monitor(live.name))
-    ]
     return NetConfig(id=cfg_id, namespaces=[], roots=roots)
 
 
@@ -313,7 +344,7 @@ def get_config(cfg_id: str) -> NetConfig:
         # Only create default config if requesting the "default" config
         if cfg_id == "default":
             log.info("Default configuration file not found. Creating default config.")
-            return _write_live_default(path)
+            return _write_live_default()
         raise FileNotFoundError(f"Configuration {cfg_id} not found.")
 
     try:
@@ -331,7 +362,7 @@ def get_config(cfg_id: str) -> NetConfig:
             # Devices upgraded from before #202 still hold the hardcoded
             # default (fake WPA2 on wlan0, wlan1 on phy1); replace it.
             log.info("Replacing the legacy hardcoded default configuration.")
-            return _write_live_default(path)
+            return _write_live_default()
         return config
     except json.JSONDecodeError as e:
         log.error(f"Configuration file {cfg_id}.json contains malformed JSON: {e}")
@@ -348,12 +379,20 @@ def get_config(cfg_id: str) -> NetConfig:
         ) from None
 
 
-def _write_live_default(path: Path) -> NetConfig:
+def _write_live_default() -> NetConfig:
     # shortcut: default.json snapshots the radios present when it is first
     # written; an adapter plugged in later is not in it until the file is
     # deleted. Upgrade path: regenerate while the file is unedited.
-    default_config = get_default_config("default")
-    _atomic_write(path, default_config.model_dump_json(indent=4))
+    try:
+        default_config = get_default_config("default")
+    except Exception as e:
+        # Core must start even when the live inventory cannot be read or
+        # yields an invalid default; nothing is written, so the next start
+        # tries again.
+        log.error(f"Could not build the default configuration: {e}")
+        return NetConfig(id="default", namespaces=[], roots=[])
+    # A fixed name (not a caller's ID), so no user data reaches this path.
+    _atomic_write(cfg_dir / "default.json", default_config.model_dump_json(indent=4))
     return default_config
 
 
@@ -369,7 +408,7 @@ def is_active(cfg_id: str) -> bool:
 
 
 def _revert_current_config_to_default() -> None:
-    _atomic_write(ccf, "default")
+    _write_current("default")
 
 
 def get_current_config() -> str:
@@ -501,11 +540,14 @@ def delete_config(cfg_id: str, force: bool = False) -> bool:
     """
     path = _config_path(cfg_id)
 
-    if is_active(cfg_id):
-        if not force:
-            raise ConfigActiveError(f"Cannot delete active configuration {cfg_id}.")
-        deactivate_config(cfg_id)
-    path.unlink()
+    # Under the change lock, so no activation can make cfg_id active again
+    # between the deactivate and the unlink.
+    with network_change_lock():
+        if is_active(cfg_id):
+            if not force:
+                raise ConfigActiveError(f"Cannot delete active configuration {cfg_id}.")
+            _deactivate_config_locked(cfg_id, False)
+        path.unlink()
     return True
 
 
@@ -573,14 +615,17 @@ def _activate_config_locked(
 
     activated_configs: list[NamespaceConfig | RootConfig] = []
     try:
-        outcomes = _apply_entries(cfg, activated_configs)
+        outcomes = _apply_entries(
+            cfg, activated_configs, only_core_managed=cfg_id == "default"
+        )
 
         # Path 1 vs 2: provisioned and connected are both acceptable — do not roll back
         # partial success (missing adapter, delayed SSID, etc.) when all outcomes qualify.
-        acceptable_statuses = {"connected", "provisioned"}
+        # "skipped" is a default entry left alone because Core did not create it.
+        acceptable_statuses = {"connected", "provisioned", "skipped"}
         if all(outcome.status in acceptable_statuses for outcome in outcomes):
             # Path 1: persist active config (monitors may still be connecting WPA)
-            _atomic_write(ccf, cfg_id)
+            _write_current(cfg_id)
             return True, outcomes
         # Path 2: UNACCEPTABLE status=error — roll back adapters that were applied
         log.error(
@@ -603,12 +648,16 @@ def _activate_config_locked(
 
 
 def _apply_entries(
-    cfg: NetConfig, activated: list[NamespaceConfig | RootConfig]
+    cfg: NetConfig,
+    activated: list[NamespaceConfig | RootConfig],
+    only_core_managed: bool = False,
 ) -> list[AdapterOutcome]:
     """Activate every entry of cfg, namespaces first; return per-entry outcomes.
 
     Entries that come up connected or provisioned are appended to `activated`
-    as they succeed, so a caller can roll them back after an exception.
+    as they succeed, so a caller can roll them back after an exception. With
+    `only_core_managed` (the default configuration), an entry whose radio
+    Core did not create is reported "skipped" and not touched.
     """
     outcomes: list[AdapterOutcome] = []
     entries: list[NamespaceConfig | RootConfig] = [
@@ -617,6 +666,19 @@ def _apply_entries(
     ]
     for entry in entries:
         where = entry.namespace if isinstance(entry, NamespaceConfig) else "root"
+        if only_core_managed and not ns.is_core_managed(entry):
+            log.info(f"Leaving {entry.interface} in {where} alone: not created by Core")
+            outcomes.append(
+                AdapterOutcome(
+                    interface=entry.interface,
+                    namespace=entry.namespace
+                    if isinstance(entry, NamespaceConfig)
+                    else None,
+                    status="skipped",
+                    detail="Not created by Core; left alone",
+                )
+            )
+            continue
         log.info(f"Activating {entry.interface} in {where}")
         result = ns.activate_config(entry)
         status = getattr(result, "status", "error") if result is not None else "error"
@@ -645,9 +707,7 @@ def _teardown_profile(cfg_id: str) -> None:
     except (FileNotFoundError, ConfigMalformedError, ValidationError) as e:
         log.warning(f"Cannot read active configuration {cfg_id} to tear down: {e}")
         profile = None
-    entries: list[NamespaceConfig | RootConfig] = []
-    if profile is not None:
-        entries = [*(profile.namespaces or []), *(profile.roots or [])]
+    entries = _entries_to_undo(profile) if profile is not None else []
     for entry in entries:
         try:
             ns.deactivate_config(entry)
@@ -672,24 +732,71 @@ def revert_all() -> None:
         except (FileNotFoundError, ConfigMalformedError):
             active = "default"
         _teardown_profile(active)
-        _atomic_write(ccf, "default")
-        _apply_default()
+        _write_current("default")
+
+
+def _entries_to_undo(cfg: NetConfig) -> list[NamespaceConfig | RootConfig]:
+    """Return cfg's entries that tearing it down may touch.
+
+    Every entry of a profile the user activated; for the default, only
+    entries whose radio Core created, so other tools' interfaces survive.
+    """
+    entries: list[NamespaceConfig | RootConfig] = [
+        *(cfg.namespaces or []),
+        *(cfg.roots or []),
+    ]
+    if cfg.id == "default":
+        entries = [entry for entry in entries if ns.is_core_managed(entry)]
+    return entries
+
+
+def _active_namespaces() -> set[str]:
+    try:
+        active = get_current_config()
+        if active == "default":
+            return set()
+        return {entry.namespace for entry in get_config(active).namespaces or []}
+    except (OSError, ConfigMalformedError, ValidationError):
+        return set()
+
+
+def left_alone() -> list[LeftAlone]:
+    """Return the namespaces holding radios that Core has left alone."""
+    return [LeftAlone(**entry) for entry in ns.left_alone(_active_namespaces())]
+
+
+def reset_namespaces(names: list[str]) -> list[NamespaceResetResult]:
+    """Return the radios in the named namespaces to root, deleting each once empty.
+
+    Only the namespaces named are touched, whoever created them; one used by
+    the active configuration is refused (deactivate it first).
+
+    Raises:
+        ConfigBusyError: If another change holds network_change_lock()
+    """
+    with network_change_lock():
+        existing = {entry["namespace"] for entry in ns.left_alone(set())}
+        in_use = _active_namespaces()
+        results = []
+        for name in names:
+            if name in in_use:
+                detail = "In use by the active configuration; deactivate it first"
+                results.append(NamespaceResetResult(namespace=name, detail=detail))
+            elif name not in existing:
+                detail = "No such namespace holding radios"
+                results.append(NamespaceResetResult(namespace=name, detail=detail))
+            else:
+                results.append(NamespaceResetResult(**ns.reset_namespace(name)))
+        return results
 
 
 def _fall_back_to_default(failed_cfg_id: str) -> None:
-    """After a failed activation, record and apply `default` so state matches."""
-    _atomic_write(ccf, "default")
-    if failed_cfg_id != "default":
-        _apply_default()
+    """After a failed activation, record `default`: no profile is active.
 
-
-def _apply_default() -> None:
-    """Best effort: put the radios into the default configuration."""
-    try:
-        outcomes = _apply_entries(get_config("default"), [])
-        log.info(f"Applied default configuration: {[o.status for o in outcomes]}")
-    except Exception as e:
-        log.warning(f"Could not apply default configuration: {e}")
+    Rollback has already returned the entries that were applied; nothing
+    else is changed, so other tools' interfaces are left alone.
+    """
+    _write_current("default")
 
 
 def deactivate_config(cfg_id: str, override_active: bool = False) -> bool:
@@ -711,32 +818,23 @@ def _deactivate_config_locked(cfg_id: str, override_active: bool) -> bool:
             raise ConfigActiveError(f"Configuration {cfg_id} is not active.")
 
     try:
-        for ns_cfg in cfg.namespaces or []:
-            log.info(
-                f"Deactivating namespace {ns_cfg.namespace} for interface {ns_cfg.interface}"
-            )
-            ns.deactivate_config(ns_cfg)
-        for root_cfg in cfg.roots or []:
-            log.info(f"Deactivating root config for interface {root_cfg.interface}")
-            ns.deactivate_config(root_cfg)
+        for entry in _entries_to_undo(cfg):
+            where = entry.namespace if isinstance(entry, NamespaceConfig) else "root"
+            log.info(f"Deactivating {entry.interface} in {where}")
+            ns.deactivate_config(entry)
 
-        _atomic_write(ccf, "default")
+        _write_current("default")
         ns.revert_to_root(None)
-        # current.txt now says default, so apply it (#271)
-        if cfg_id != "default":
-            _apply_default()
         return True
 
     except Exception as ex:
         log.error(f"Failed to deactivate config {cfg_id}: {ex}")
         # Ensure ccf/revert complete even when a later adapter raises (mirror activate rollback)
         try:
-            _atomic_write(ccf, "default")
+            _write_current("default")
             ns.revert_to_root(None)
         except Exception as cleanup_error:
             log.warning(
                 f"Error completing deactivate cleanup for {cfg_id}: {cleanup_error} (non-critical)"
             )
-        if cfg_id != "default":
-            _apply_default()
         raise

@@ -73,8 +73,8 @@ def _write_pid(path: Path, pid: int) -> None:
 def test_pidfile_is_keyed_by_namespace_and_iface(run_dir):
     root = supplicant.pidfile_path("wlan1", None)
     lab = supplicant.pidfile_path("wlan1", "lab_ns")
-    assert root == run_dir / "wpa_supplicant" / "@root" / "wlan1.pid"
-    assert lab == run_dir / "wpa_supplicant" / "lab_ns" / "wlan1.pid"
+    assert root == run_dir / "wpa" / "@root" / "wlan1.pid"
+    assert lab == run_dir / "wpa" / "lab_ns" / "wlan1.pid"
 
 
 def test_stop_supplicant_kills_only_its_pid(run_dir, procs):
@@ -171,7 +171,7 @@ def test_start_records_pidfile_and_stops_previous(run_dir, procs):
     assert procs.killed == [100]
     start = ns_exec.call_args_list[-1]
     argv = start.args[0]
-    runtime = run_dir / "wpa_supplicant" / "lab_ns"
+    runtime = run_dir / "wpa" / "lab_ns"
     assert argv[argv.index("-P") + 1] == str(runtime / "wlan1.pid")
     assert argv[argv.index("-c") + 1] == str(runtime / "wlan1.conf")
     assert argv[argv.index("-f") + 1] == str(runtime / "wlan1.log")
@@ -192,24 +192,25 @@ def test_runtime_paths_do_not_collide_across_namespaces(run_dir):
     }
     flat = [str(p) for triple in paths.values() for p in triple]
     assert len(flat) == len(set(flat))
-    assert supplicant.ctrl_dir(None) == "/run/wpa_supplicant"
+    assert supplicant.ctrl_dir(None) == supplicant.ROOT_CTRL_DIR
 
 
-def test_wpa_cli_uses_core_ctrl_dir_only_when_core_owns_the_socket(run_dir):
+def test_wpa_cli_uses_core_ctrl_dir_only_when_core_started_the_supplicant(run_dir):
     assert supplicant.wpa_cli_command("wlan1", "ns_a", "status") == [
         "wpa_cli",
         "-p",
-        "/run/wpa_supplicant",
+        supplicant.ROOT_CTRL_DIR,
         "-i",
         "wlan1",
         "status",
     ]
-    ctrl = Path(supplicant.ctrl_dir("ns_a"))
-    ctrl.mkdir(parents=True)
-    (ctrl / "wlan1").touch()
+    # Core's pidfile decides, even before the control socket exists.
+    pidfile = supplicant.pidfile_path("wlan1", "ns_a")
+    pidfile.parent.mkdir(parents=True)
+    pidfile.write_text("100\n")
     assert supplicant.wpa_cli_command("wlan1", "ns_a", "status")[1:3] == [
         "-p",
-        str(ctrl),
+        supplicant.ctrl_dir("ns_a"),
     ]
 
 

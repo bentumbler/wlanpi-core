@@ -25,6 +25,18 @@ matrix `test_matrix.py`.
 
 ## Status (2026-09-23)
 
+**Review round 1 (Josh, five devices) addressed** as fix commits on each
+owning branch merged up the stack (no force-push); per-PR mapping comments
+and a retest summary on #302 (tip `b7f0dd6`). New on top: P14 (#301) Core
+only touches netdevs it created (tmpfs ledger netns+name+ifindex; default is
+a no-op after reboot; deactivate restores its own root entries) and P15
+(#302) `GET /network/config/leftovers` + `POST /network/config/reset`.
+dhcpcd now stops with SIGALRM (SIGHUP only rebinds in dhcpcd 10). Gates
+green on every branch (tip 694 passed); HIL 163/163 on the tip .deb;
+manual scenario script `/home/wlanpi/ns-manual-tests.sh` (auto set 43/43).
+Deferred: #292, #293 skip-recreate, #294, #237.
+
+
 All planned PRs are implemented, gated, and hardware-verified on a Trixie
 WLAN Pi (ath12k PCIe + 2x MT7921AU USB, iw 6.17, wpa_supplicant 2.12,
 dhcpcd 10.1), and open upstream as stacked **draft** PRs against `dev`.
@@ -50,6 +62,8 @@ suite (installed .deb driven through the local API) ends at 127/127.
 | P11 #272 secrets | p11-secrets | #297 | 2.3.19 |
 | P12 #276 outcomes | p12-activation-outcomes | #298 | 2.3.20 |
 | P13 #274 wlan/revert | p13-wlan-revert | #299 | 2.3.21 |
+| P14 #202/#288 Core-owned interfaces | p14-core-ownership | #301 | 2.3.22 |
+| P15 leftovers + reset | p15-leftovers-reset | #302 | 2.3.23 |
 
 Found on hardware and fixed in the series: dhclient missing on Trixie
 (dhcpcd per namespace, P9); dhcpcd state collides across netns (P9); a

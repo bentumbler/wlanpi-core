@@ -105,7 +105,7 @@ def test_stop_dhcp_releases_only_its_own_dhcpcd(run_dir):
         with patch.object(nm.os, "kill", side_effect=procs.kill):
             nm.stop_dhcp("sta0", "ns_a")
             nm.stop_dhcp("sta0", "ns_c")
-    assert procs.signals == [(10, signal.SIGHUP)]
+    assert procs.signals == [(10, signal.SIGALRM)]
 
 
 def test_stop_namespace_dhcp_covers_every_iface(run_dir):
@@ -158,3 +158,47 @@ def test_default_route_goes_via_the_dhcp_router():
         "metric",
         "200",
     ]
+
+
+def test_dhcpcd_wrapper_creates_mount_points_before_binding(run_dir):
+    # /run/dhcpcd is tmpfs and absent on a fresh boot; binding onto it fails.
+    # (Josh Schmelzle, review of #291.)
+    with patch.object(nm, "ns_exec") as ns_exec:
+        nm.restart_dhcp_with_timeout("sta0", "ns_a")
+    argv = _started_argv(ns_exec)
+    script = argv[argv.index("-c") + 1]
+    assert script.index("mkdir -p /run/dhcpcd /var/lib/dhcpcd") < script.index(
+        "mount --bind"
+    )
+
+
+def test_stop_dhcp_does_not_match_a_longer_iface_name(run_dir):
+    procs = _Procs({10: ["dhcpcd: wlan10 [ip4]"]})
+    _pidfile(run_dir, None, "wlan1", 10)  # stale: PID now runs dhcpcd for wlan10
+    with patch.object(nm, "_read_cmdline", side_effect=procs.cmdline):
+        with patch.object(nm.os, "kill", side_effect=procs.kill):
+            nm.stop_dhcp("wlan1", None)
+    assert procs.signals == []
+
+
+def test_stop_dhcp_sends_sigalrm_and_removes_its_state(run_dir):
+    # dhcpcd 10: SIGALRM releases and exits; SIGHUP only rebinds.
+    procs = _Procs({10: ["dhcpcd: wlan1 [ip4]"]})
+    _pidfile(run_dir, None, "wlan1", 10)
+    lease = run_dir / "dhcpcd" / "@root" / "wlan1" / "lib" / "wlan1-Pi_test.lease"
+    lease.parent.mkdir(parents=True)
+    lease.write_text("")
+    with patch.object(nm, "_read_cmdline", side_effect=procs.cmdline):
+        with patch.object(nm.os, "kill", side_effect=procs.kill):
+            nm.stop_dhcp("wlan1", None)
+    assert procs.signals == [(10, signal.SIGALRM)]
+    assert not (run_dir / "dhcpcd" / "@root").exists()
+
+
+def test_restart_keeps_the_state_for_the_next_lease(run_dir):
+    lease = run_dir / "dhcpcd" / "@root" / "wlan1" / "lib" / "duid"
+    lease.parent.mkdir(parents=True)
+    lease.write_text("x")
+    with patch.object(nm, "ns_exec"):
+        nm.restart_dhcp_with_timeout("wlan1", None)
+    assert lease.read_text() == "x"

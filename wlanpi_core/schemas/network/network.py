@@ -434,7 +434,12 @@ class AdapterOutcome(BaseModel):
 
     interface: str
     namespace: str | None = None
-    status: str = Field(description="connected, provisioned or error")
+    status: str = Field(
+        description=(
+            "connected, provisioned or error; skipped for a default entry whose "
+            "radio Core did not create"
+        )
+    )
     detail: str = ""
     invalid: bool = Field(
         default=False, description="The entry failed configuration validation"
@@ -474,11 +479,64 @@ class ConnectedNetwork(BaseModel):
     connectedNet: ScanItem | None
 
 
+class LeftAlone(BaseModel):
+    """A namespace holding radios that Core did not clean up, and why."""
+
+    namespace: str
+    interfaces: list[str] = []
+    phys: list[str] = []
+    core_created: bool = False
+    reason: str
+
+
+class LeftoversResponse(BaseModel):
+    """Namespaces Core left alone; clear them with POST /network/config/reset."""
+
+    left_alone: list[LeftAlone] = []
+
+
+class DeactivationResponse(BaseModel):
+    """Result of deactivating a configuration."""
+
+    id: str
+    message: str
+    left_alone: list[LeftAlone] = []
+
+
+class NamespaceResetRequest(BaseModel):
+    """Namespaces to return to root, named explicitly by the caller."""
+
+    namespaces: list[str] = Field(min_length=1)
+
+    @field_validator("namespaces")
+    @classmethod
+    def validate_namespaces(cls, value: list[str]) -> list[str]:
+        """Validate each namespace name."""
+        return [validate_namespace_name(name) for name in value]
+
+
+class NamespaceResetResult(BaseModel):
+    """What resetting one namespace did."""
+
+    namespace: str
+    phys_returned: list[str] = []
+    deleted: bool = False
+    remaining: list[str] = []
+    detail: str = ""
+
+
+class NamespaceResetResponse(BaseModel):
+    """Per-namespace results of a reset."""
+
+    results: list[NamespaceResetResult]
+
+
 class RevertNamespace(BaseModel):
     """Result of reverting a namespace."""
 
     success: bool = Field(json_schema_extra={"example": True})
     message: str
+    left_alone: list[LeftAlone] = []
 
 
 class Interface(BaseModel):

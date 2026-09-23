@@ -1,3 +1,35 @@
+wlanpi-core (2.3.23-1) unstable; urgency=medium
+
+  * Report namespaces Core has left alone: GET /network/config/leftovers,
+    and a left_alone list on deactivate and /wlan/revert. That is a
+    namespace Core created that is still present, or another tool's
+    namespace holding wireless radios.
+  * Add POST /network/config/reset: the caller names namespaces and Core
+    returns their radios to root, deleting each once empty. The active
+    configuration's namespaces are refused. "leftovers" and "reset" are now
+    reserved configuration IDs.
+
+ -- Ben Toner <ben@numerousnetworks.co.uk>  Wed, 23 Sep 2026 04:21:07 -0500
+
+wlanpi-core (2.3.22-1) unstable; urgency=medium
+
+  * Track the interfaces Core creates (by namespace, name and ifindex, on
+    tmpfs) and make the default configuration touch only those and radios
+    in namespaces Core created. Interfaces from drivers or other tools, such
+    as wlanpi-profiler's hostapd, are left alone and reported as skipped;
+    after a reboot the default is a no-op (#202).
+  * Deactivate restores its own root entries (the interface name, managed)
+    instead of applying the default afterwards, and a failed activation only
+    records default (#288, #271).
+  * A revert step that fails is reported instead of leaving a radio without
+    an interface, and a failure after prepare (e.g. wpa_supplicant not
+    starting) puts that entry back.
+  * Namespace markers record the namespace's identity, so a same-named
+    namespace created by another tool is not taken for Core's, and a marker
+    is only removed once its namespace is gone (#275).
+
+ -- Ben Toner <ben@numerousnetworks.co.uk>  Wed, 23 Sep 2026 04:11:19 -0500
+
 wlanpi-core (2.3.21-1) unstable; urgency=medium
 
   * Make the deprecated POST /network/wlan/revert do what it says and say
@@ -110,7 +142,8 @@ wlanpi-core (2.3.13-1) unstable; urgency=medium
 wlanpi-core (2.3.12-1) unstable; urgency=medium
 
   * Key wpa_supplicant runtime state by (namespace, interface): the config,
-    log and pidfile live under /run/wlanpi-core/wpa_supplicant/<netns>/, and
+    log and pidfile live under /run/wlanpi-core/wpa/<netns>/ (short enough
+    for the control socket path at the longest names), and
     supplicants in a namespace get their own control socket directory, so
     the same interface name in two namespaces no longer shares one (#273).
   * Write each supplicant config with only that entry's network, mode 0600,
@@ -121,6 +154,8 @@ wlanpi-core (2.3.12-1) unstable; urgency=medium
     cannot rewrite the root /etc/resolv.conf.
   * Reject a profile whose entries share an interface, use another entry's
     interface as a display name, or reuse a name within one namespace.
+    A stored profile that breaks these rules is still listed, but GET and
+    activate now return 422 for it.
 
  -- Ben Toner <ben@numerousnetworks.co.uk>  Tue, 22 Sep 2026 20:35:43 -0500
 
@@ -132,6 +167,9 @@ wlanpi-core (2.3.11-1) unstable; urgency=medium
   * Return namespaces to root by walking their phys rather than their
     interfaces, so a phy with no netdev, or several netdevs, comes back, and
     delete a namespace only once no phys or links remain in it.
+  * A namespace created by an earlier Core version has no marker, so it is
+    not deleted until reboot. A phy returned without a netdev stays in root
+    with no interface until a profile or a tool creates one.
 
  -- Ben Toner <ben@numerousnetworks.co.uk>  Tue, 22 Sep 2026 20:20:05 -0500
 

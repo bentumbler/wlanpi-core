@@ -1,6 +1,8 @@
 """Service managing network namespaces, interfaces, and apps."""
 
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from wlanpi_core.constants import (
     DEFAULT_CTRL_INTERFACE,
     DEFAULT_DHCP_DIR,
     NETNS_ETC_DIR,
+    NETNS_RUN_DIR,
     PID_DIR,
     RUN_DIR,
 )
@@ -40,6 +43,7 @@ from wlanpi_core.utils.network_management import (
     stop_dhcp,
     stop_namespace_dhcp,
 )
+from wlanpi_core.utils.validation import validate_namespace_name
 from wlanpi_core.wpa import config as wpa_config
 from wlanpi_core.wpa import status as wpa_status
 from wlanpi_core.wpa import supplicant as wpa_supplicant
@@ -228,15 +232,6 @@ class NetworkNamespaceService:
         self.log.info("Updating global settings: %s", settings)
         self.global_settings.update(settings)
 
-    def parse_wpa_log(self, iface: str, timeout: int = 30) -> None:
-        """
-        Parse wpa_supplicant log file.
-
-        Delegates to wpa.supplicant module.
-        Note: Event logging is not preserved in the extracted function.
-        """
-        wpa_supplicant.parse_wpa_log(iface, timeout=timeout)
-
     def get_interfaces(self) -> list[Any]:
         """Get list of wireless interfaces using the adapter discovery module."""
         return discovery.list_interfaces()
@@ -336,59 +331,70 @@ class NetworkNamespaceService:
                 input=cfg.__str__(),
             )
 
-        # Use display name if available, otherwise fall back to interface
-        iface = cfg.iface_display_name or iface
-        connected_state = False
-
-        if cfg.security:
-            # Additional validation: ensure ssid exists (should be caught by validation, but double-check)
-            if not hasattr(cfg.security, "ssid") or not cfg.security.ssid:
-                error_msg = "security.ssid is required when security is provided"
-                self.log.error(error_msg)
-                log = NetworkSetupLog(selectErr=error_msg, eventLog=self.event_log)
-                return NetworkSetupStatus(
-                    status="error",
-                    response=log,
-                    connectedNet=None,
-                    input=cfg.__str__(),
-                )
-
-            wpa_config.write_wpa_config(
-                cfg,
-                wpa_supplicant.config_path(iface, namespace),
-                self.global_settings,
-                self._ctrl_dir(namespace),
-            )
-            wpa_supplicant.start_or_restart_supplicant(iface, namespace)
-
-            # Start background connection monitor instead of blocking
-            # This allows the method to return immediately with "provisioned" status
-            # The monitor will handle DHCP, default route, and app startup when connection completes
-            self.log.info(
-                f"Started wpa_supplicant for {iface} in {namespace_display}. "
-                f"Connection will be monitored in background. Returning with 'provisioned' status."
-            )
-            self._monitor_connection_async(cfg, iface, namespace, timeout=15)
-
-            # Return immediately with "provisioned" status - connection is in progress
-            connected_state = False  # Will be updated by background monitor
-        else:
-            # No security config, so no connection needed
+        # From here the radio is configured; if anything below fails, put it
+        # back rather than leave it moved and recreated in the new mode.
+        try:
+            # Use display name if available, otherwise fall back to interface
+            iface = cfg.iface_display_name or iface
             connected_state = False
 
-        # Only attempt to set default route if explicitly requested AND connected
-        # NOTE: For security configs, this is now handled by the background monitor
-        # This check is only for non-security configs or immediate connection cases
-        if cfg.default_route and connected_state:
-            set_default_route(iface, namespace)
+            if cfg.security:
+                # Additional validation: ensure ssid exists (should be caught by validation, but double-check)
+                if not hasattr(cfg.security, "ssid") or not cfg.security.ssid:
+                    error_msg = "security.ssid is required when security is provided"
+                    self.log.error(error_msg)
+                    log = NetworkSetupLog(selectErr=error_msg, eventLog=self.event_log)
+                    return NetworkSetupStatus(
+                        status="error",
+                        response=log,
+                        connectedNet=None,
+                        input=cfg.__str__(),
+                    )
 
-        # Start app if configured
-        # NOTE: For security configs, app startup is now handled by background monitor
-        # This is only for non-security configs
-        if cfg.autostart_app and not cfg.security:
-            apps.start_app_in_namespace(
-                namespace, cfg.autostart_app, pid_dir=self.pid_dir
-            )
+                wpa_config.write_wpa_config(
+                    cfg,
+                    wpa_supplicant.config_path(iface, namespace),
+                    self.global_settings,
+                    self._ctrl_dir(namespace),
+                )
+                wpa_supplicant.start_or_restart_supplicant(iface, namespace)
+
+                # Start background connection monitor instead of blocking
+                # This allows the method to return immediately with "provisioned" status
+                # The monitor will handle DHCP, default route, and app startup when connection completes
+                self.log.info(
+                    f"Started wpa_supplicant for {iface} in {namespace_display}. "
+                    f"Connection will be monitored in background. Returning with 'provisioned' status."
+                )
+                self._monitor_connection_async(cfg, iface, namespace, timeout=15)
+
+                # Return immediately with "provisioned" status - connection is in progress
+                connected_state = False  # Will be updated by background monitor
+            else:
+                # No security config, so no connection needed
+                connected_state = False
+
+            # Only attempt to set default route if explicitly requested AND connected
+            # NOTE: For security configs, this is now handled by the background monitor
+            # This check is only for non-security configs or immediate connection cases
+            if cfg.default_route and connected_state:
+                set_default_route(iface, namespace)
+
+            # Start app if configured
+            # NOTE: For security configs, app startup is now handled by background monitor
+            # This is only for non-security configs
+            if cfg.autostart_app and not cfg.security:
+                apps.start_app_in_namespace(
+                    namespace, cfg.autostart_app, pid_dir=self.pid_dir
+                )
+
+        except Exception as e:
+            self.log.error(f"Setup after prepare failed for {iface}: {e}; reverting it")
+            try:
+                self.revert_to_root(cfg)
+            except Exception as revert_error:
+                self.log.error(f"Could not revert {iface}: {revert_error}")
+            raise
 
         connected = None
         # For security configs with async monitoring, always return "provisioned" initially
@@ -482,16 +488,17 @@ class NetworkNamespaceService:
         namespace_display = namespace if namespace else "root"
         self.log.info("Removing network %s from namespace %s", iface, namespace_display)
 
-        # Runtime config, plus files written by Core before they were keyed
-        # by (namespace, iface) under /run
+        # Runtime config and log, plus the wlanN.conf / wlanN.cfg that Core
+        # wrote under /etc before runtime state moved to /run. Only that exact
+        # name pattern: a display name such as "wpa_supplicant" must never
+        # remove /etc/wpa_supplicant/wpa_supplicant.conf.
         stale = [
             wpa_supplicant.config_path(iface, namespace),
-            self.config_dir / f"{iface}.conf",
-            self.dhcp_dir / f"{iface}.cfg",
+            wpa_supplicant.log_path(iface, namespace),
         ]
-        if iface.startswith("wlan") and iface[4:].isdigit():
-            stale.append(self.config_dir / f"wlan{iface[4:]}.conf")
-            stale.append(self.dhcp_dir / f"wlan{iface[4:]}.cfg")
+        if re.fullmatch(r"wlan[0-9]+", iface):
+            stale.append(self.config_dir / f"{iface}.conf")
+            stale.append(self.dhcp_dir / f"{iface}.cfg")
         for config_file in stale:
             self._safe_unlink(config_file)
 
@@ -532,26 +539,43 @@ class NetworkNamespaceService:
         self._safe_unlink(Path(self._ctrl_dir(namespace)) / live.name)
         stop_dhcp(live.name, namespace)
 
-        # Already in root: nothing to move, and root is not a real namespace
         if namespace is None:
+            # Root entry: put the radio back as `interface`, managed, so the
+            # profile's name and mode do not outlive it (#288).
+            if live.name != iface or live.type != "managed":
+                self._recreate_in_root(live, iface)
             return
 
-        try:
-            interface.delete_interface(live.name, namespace=namespace)
-            phy.move_phy_to_root(live.phy, namespace)
-            interface.create_interface(
-                live.phy, iface, interface_type="managed", namespace=None
-            )
-            interface.bring_interface_up(iface, namespace=None)
-            self.log.info(f"Reverted {iface} on {live.phy} to root namespace.")
-        except RunCommandError as e:
-            self.log.warning(
-                f"Could not fully revert {live.name} from {namespace_display}: {e}"
-            )
+        self._recreate_in_root(live, iface)
+        self.log.info(f"Reverted {iface} on {live.phy} to root namespace.")
 
         # Delete the namespace only if Core created it and nothing is left in it
         if delete_namespace and namespace in self.core_namespaces():
             self._delete_namespace_if_empty(namespace)
+
+    def _recreate_in_root(self, live: discovery.LiveInterface, name: str) -> None:
+        """Delete `live`, return its phy to root, and recreate it as managed `name`.
+
+        Each step is checked: if one fails, the original netdev is restored
+        and the error propagates, so a revert that did not happen is never
+        reported as done and its namespace is not deleted.
+        """
+        # A failed delete changes nothing; let it propagate as is.
+        interface.delete_interface(live.name, namespace=live.netns)
+        moved_to = live.netns
+        try:
+            if live.netns is not None:
+                phy.move_phy_to_root(live.phy, live.netns)
+                moved_to = None
+            interface.create_interface(
+                live.phy, name, interface_type="managed", namespace=None
+            )
+            interface.bring_interface_up(name, namespace=None)
+        except RunCommandError as e:
+            self.log.error(f"Could not return {live.name} on {live.phy} to root: {e}")
+            self._restore_live(live, name, moved_to, None)
+            raise
+        self._claim(name, None)
 
     def _ctrl_dir(self, namespace: str | None) -> str:
         """Return the control socket directory for a supplicant in `namespace`."""
@@ -564,6 +588,54 @@ class NetworkNamespaceService:
     def _namespace_marker(self, namespace: str) -> Path:
         # /run is tmpfs, like /run/netns, so a marker lives as long as its netns.
         return Path(RUN_DIR) / "netns" / namespace
+
+    def _netns_id(self, namespace: str) -> str | None:
+        """Return the identity (inode) of a named netns, or None if it is gone."""
+        try:
+            return str(os.stat(Path(NETNS_RUN_DIR) / namespace).st_ino)
+        except OSError:
+            return None
+
+    # --- netdevs Core created ---
+    #
+    # Core deletes and recreates every netdev it configures, so "created by
+    # Core" is exactly "Core's responsibility". Automatic changes (the default
+    # configuration) only touch those; netdevs from drivers or other tools
+    # (hostapd, wlanpi-profiler, a user's mon0) are left alone. Keyed by
+    # (netns, name) and checked against the ifindex, which a netns move keeps
+    # and a recreate by anyone else changes. On tmpfs, so a reboot resets it.
+
+    def _owned_path(self, name: str, netns: str | None) -> Path:
+        return Path(RUN_DIR) / "owned" / (netns or "@root") / name
+
+    def _claim(self, name: str, netns: str | None) -> None:
+        """Record the netdev Core just created as Core's."""
+        for live in discovery.list_interfaces_all_namespaces():
+            if live.name == name and live.netns == netns and live.ifindex is not None:
+                path = self._owned_path(name, netns)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(str(live.ifindex))
+                return
+
+    def _is_owned(self, live: discovery.LiveInterface) -> bool:
+        try:
+            recorded = self._owned_path(live.name, live.netns).read_text().strip()
+        except OSError:
+            return False
+        return live.ifindex is not None and recorded == str(live.ifindex)
+
+    def is_core_managed(self, cfg: NamespaceConfig | RootConfig) -> bool:
+        """Return whether automatic changes may touch cfg's radio.
+
+        True for a netdev Core created, a radio in a namespace Core created,
+        or a radio that is not present (activation just skips it).
+        """
+        live = self._find_live(cfg)
+        if live is None:
+            return True
+        if live.netns is not None:
+            return live.netns in self.core_namespaces()
+        return self._is_owned(live)
 
     def core_namespaces(self) -> list[str]:
         """Return the existing namespaces that Core created, dropping stale markers."""
@@ -578,13 +650,33 @@ class NetworkNamespaceService:
         owned = []
         for marker in sorted(marker_dir.iterdir()):
             if marker.name in existing:
-                owned.append(marker.name)
+                recorded = marker.read_text().strip()
+                if recorded and recorded == self._netns_id(marker.name):
+                    owned.append(marker.name)
+                else:
+                    # Same name, different namespace (deleted and recreated
+                    # by someone else): not Core's. Leave its /etc alone.
+                    marker.unlink(missing_ok=True)
             else:
+                # Deleted out of band: drop the marker and Core's /etc overlay
                 marker.unlink(missing_ok=True)
+                self._remove_netns_etc(marker.name)
         return owned
 
-    def _return_namespace_phys(self, namespace: str) -> None:
-        """Stop Core's supplicants in `namespace` and move every phy in it to root."""
+    def _remove_netns_etc(self, namespace: str) -> None:
+        """Remove the resolv.conf Core wrote for `namespace`, and its dir if empty."""
+        etc_dir = Path(NETNS_ETC_DIR) / namespace
+        (etc_dir / "resolv.conf").unlink(missing_ok=True)
+        try:
+            etc_dir.rmdir()
+        except OSError:
+            pass  # absent, or holds files Core did not write
+
+    def _return_namespace_phys(self, namespace: str) -> list[str]:
+        """Stop Core's supplicants in `namespace`, move every phy in it to root.
+
+        Returns the phys moved.
+        """
         self.log.info(f"Returning phys in namespace {namespace} to root")
         wpa_supplicant.stop_namespace_supplicants(namespace)
         stop_namespace_dhcp(namespace)
@@ -592,13 +684,105 @@ class NetworkNamespaceService:
             phys = phy.list_phys(namespace=namespace)
         except RunCommandError as e:
             self.log.warning(f"Could not list phys in {namespace}: {e}")
-            return
+            return []
+        moved: list[str] = []
+        inventory = discovery.list_interfaces_all_namespaces()
         for phy_name in phys:
+            travelling = [
+                live
+                for live in inventory
+                if live.netns == namespace
+                and f"phy{live.phy_index}" == phy_name
+                and self._is_owned(live)
+            ]
             try:
                 phy.move_phy_to_root(phy_name, namespace)
                 self.log.info(f"Moved {phy_name} from namespace {namespace} to root")
             except RunCommandError as e:
                 self.log.warning(f"Could not move {phy_name} from {namespace}: {e}")
+                continue
+            moved.append(phy_name)
+            # Core's netdevs travel with the phy and keep their ifindex.
+            for live in travelling:
+                self._owned_path(live.name, namespace).unlink(missing_ok=True)
+                self._claim(live.name, None)
+        return moved
+
+    def left_alone(self, in_use: set[str]) -> list[dict[str, Any]]:
+        """Report namespaces holding radios that Core has not cleaned up.
+
+        A namespace Core created that is still present (and not used by the
+        active configuration) is listed, as is any other namespace that holds
+        wireless phys or interfaces. Other namespaces are not Core's concern.
+        """
+        core = set(self.core_namespaces())
+        try:
+            names = ns_namespace.list_namespaces()
+        except ns_namespace.NetworkNamespaceError as e:
+            self.log.warning(f"Failed to list namespaces: {e}")
+            return []
+        inventory = discovery.list_interfaces_all_namespaces()
+        found: list[dict[str, Any]] = []
+        for name in names:
+            if name in in_use:
+                continue
+            try:
+                validate_namespace_name(name)
+            except ValueError:
+                found.append({"namespace": name, "reason": "Name Core cannot manage"})
+                continue
+            try:
+                phys = phy.list_phys(namespace=name)
+            except RunCommandError:
+                phys = []
+            ifaces = [live.name for live in inventory if live.netns == name]
+            if name in core:
+                reason = "Created by Core and not removed"
+            elif phys or ifaces:
+                reason = "Not created by Core; holds wireless radios"
+            else:
+                continue
+            found.append(
+                {
+                    "namespace": name,
+                    "interfaces": ifaces,
+                    "phys": phys,
+                    "core_created": name in core,
+                    "reason": reason,
+                }
+            )
+        return found
+
+    def reset_namespace(self, namespace: str) -> dict[str, Any]:
+        """Return every phy in `namespace` to root and delete it once empty.
+
+        Only on an explicit request naming this namespace: it may belong to
+        another tool. Processes running inside it are not killed.
+        """
+        owned = namespace in self.core_namespaces()
+        moved = self._return_namespace_phys(namespace)
+        self.stop_app_in_namespace(namespace)
+        try:
+            remaining = phy.list_phys(
+                namespace=namespace
+            ) + ns_interfaces.get_interfaces_in_namespace(
+                namespace, include_loopback=False
+            )
+        except RunCommandError as e:
+            return {"namespace": namespace, "phys_returned": moved, "detail": str(e)}
+        deleted = False
+        if not remaining:
+            ns_namespace.delete_namespace(namespace, raise_on_fail=False)
+            deleted = not ns_namespace.namespace_exists(namespace)
+            if deleted and owned:
+                self._namespace_marker(namespace).unlink(missing_ok=True)
+                self._remove_netns_etc(namespace)
+        return {
+            "namespace": namespace,
+            "phys_returned": moved,
+            "deleted": deleted,
+            "remaining": remaining,
+        }
 
     def _delete_namespace_if_empty(self, namespace: str) -> None:
         """Delete a Core namespace once no phys or non-loopback links remain."""
@@ -616,13 +800,12 @@ class NetworkNamespaceService:
             self.log.warning(f"Keeping namespace {namespace}; still holds {remaining}")
             return
         ns_namespace.delete_namespace(namespace, raise_on_fail=False)
+        if ns_namespace.namespace_exists(namespace):
+            # Keep the marker so Core still owns (and retries) it.
+            self.log.warning(f"Could not delete namespace {namespace}")
+            return
         self._namespace_marker(namespace).unlink(missing_ok=True)
-        etc_dir = Path(NETNS_ETC_DIR) / namespace
-        (etc_dir / "resolv.conf").unlink(missing_ok=True)
-        try:
-            etc_dir.rmdir()
-        except OSError:
-            pass  # absent, or holds files Core did not write
+        self._remove_netns_etc(namespace)
         self.log.info(f"Deleted namespace {namespace}.")
 
     def start_app_in_namespace(self, namespace: str | None, app_id: str) -> None:
@@ -738,6 +921,7 @@ class NetworkNamespaceService:
                 interface_type=live.type or "managed",
                 namespace=live.netns,
             )
+            self._claim(live.name, live.netns)
         except RunCommandError as e:
             self.log.error(f"Could not restore {live.name} on {live.phy}: {e}")
         if created_namespace is not None:
@@ -775,6 +959,7 @@ class NetworkNamespaceService:
             self.log.error(f"Root setup failed for {iface_name}: {e}")
             self._restore_live(live, iface_name, moved_to, None)
             raise
+        self._claim(iface_name, None)
         return True
 
     def _prepare_namespace(
@@ -798,14 +983,24 @@ class NetworkNamespaceService:
         if not ns_namespace.namespace_exists(namespace):
             self.log.info("Creating namespace %s", namespace)
             ns_namespace.create_namespace(namespace)
-            marker = self._namespace_marker(namespace)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch()
-            # `ip netns exec` bind-mounts /etc/netns/<ns>/resolv.conf over
-            # /etc/resolv.conf, so DHCP in the namespace cannot rewrite root DNS.
-            etc_dir = Path(NETNS_ETC_DIR) / namespace
-            etc_dir.mkdir(parents=True, exist_ok=True)
-            (etc_dir / "resolv.conf").touch()
+            try:
+                # The marker records the namespace's identity, so a later
+                # namespace of the same name made by another tool is not
+                # mistaken for Core's.
+                marker = self._namespace_marker(namespace)
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(self._netns_id(namespace) or "")
+                # `ip netns exec` bind-mounts /etc/netns/<ns>/resolv.conf over
+                # /etc/resolv.conf, so DHCP in the namespace cannot rewrite
+                # root DNS. Empty, not touched: a namespace reusing this name
+                # must not inherit the previous one's nameservers.
+                etc_dir = Path(NETNS_ETC_DIR) / namespace
+                etc_dir.mkdir(parents=True, exist_ok=True)
+                (etc_dir / "resolv.conf").write_text("")
+            except OSError:
+                ns_namespace.delete_namespace(namespace, raise_on_fail=False)
+                self._namespace_marker(namespace).unlink(missing_ok=True)
+                raise
             created_namespace = namespace
         else:
             self.log.info("Namespace %s already exists", namespace)
@@ -838,6 +1033,7 @@ class NetworkNamespaceService:
             self.log.error("Namespace setup failed for %s: %s", iface_name, e)
             self._restore_live(live, iface_name, moved_to, created_namespace)
             raise
+        self._claim(iface_name, namespace)
         return True
 
     def _ns_exec(
