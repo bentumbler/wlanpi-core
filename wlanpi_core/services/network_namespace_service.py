@@ -503,7 +503,7 @@ class NetworkNamespaceService:
         """Move interfaces and PHYs back to the root namespace."""
         # No cfg: return every phy in every namespace Core created
         if cfg is None:
-            for ns_name in self._core_namespaces():
+            for ns_name in self.core_namespaces():
                 self._return_namespace_phys(ns_name)
                 if delete_namespace:
                     self._delete_namespace_if_empty(ns_name)
@@ -549,7 +549,7 @@ class NetworkNamespaceService:
             )
 
         # Delete the namespace only if Core created it and nothing is left in it
-        if delete_namespace and namespace in self._core_namespaces():
+        if delete_namespace and namespace in self.core_namespaces():
             self._delete_namespace_if_empty(namespace)
 
     def _ctrl_dir(self, namespace: str | None) -> str:
@@ -564,7 +564,7 @@ class NetworkNamespaceService:
         # /run is tmpfs, like /run/netns, so a marker lives as long as its netns.
         return Path(RUN_DIR) / "netns" / namespace
 
-    def _core_namespaces(self) -> list[str]:
+    def core_namespaces(self) -> list[str]:
         """Return the existing namespaces that Core created, dropping stale markers."""
         marker_dir = Path(RUN_DIR) / "netns"
         if not marker_dir.is_dir():
