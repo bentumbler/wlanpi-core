@@ -16,7 +16,7 @@ api() { curl -sk -X "$1" -H "Authorization: Bearer $WLANPI_TOKEN" -H 'Content-Ty
 show() {
   local out="  [$1]"
   for where in root $NS; do
-    local pre=(); [ $where = root ] || pre=(ip netns exec $NS)
+    local pre=(); [ "$where" = root ] || pre=(ip netns exec "$NS")
     local ifs; ifs=$(sudo "${pre[@]}" iw dev 2>/dev/null | awk '/^phy#/{p=$1}/Interface/{n=$2}/ifindex/{i=$2}/type/{if(n!=""){printf "%s:%s(ifx%s,%s) ",p,n,i,$2};n=""}')
     out="$out $where{ $ifs}"
   done; echo "$out"
@@ -28,10 +28,10 @@ normalize() { # profile inactive, namespace gone, each hwsim phy in root with on
   api POST "/deactivate/nsexp-a?override_active=true" >/dev/null
   for p in $(sudo ip netns exec $NS iw dev 2>/dev/null | awk '/^phy#/{print $1}'); do sudo ip netns exec $NS iw $p set netns 1; done
   sudo ip netns del $NS 2>/dev/null
-  for n in wlan1 wlan2 wlan3 $(ls /sys/class/net | grep -E '^wlanpi[0-9]+$'); do
-    [ -e /sys/class/net/$n ] && ! [ -e /sys/class/net/$n/phy80211 ] && sudo ip link del $n   # dummies only
+  for d in /sys/class/net/wlan1 /sys/class/net/wlan2 /sys/class/net/wlan3 /sys/class/net/wlanpi[0-9]*; do
+    [ -e "$d" ] && ! [ -e "$d/phy80211" ] && sudo ip link del "${d##*/}"   # dummies only
   done
-  for p in $HP1 $HP2; do for n in $(ls /sys/class/ieee80211/$p/device/net 2>/dev/null); do sudo iw dev $n del; done; done
+  for p in "$HP1" "$HP2"; do for d in /sys/class/ieee80211/"$p"/device/net/*; do [ -e "$d" ] && sudo iw dev "${d##*/}" del; done; done
   sudo iw phy $HP1 interface add wlan1 type managed; sudo iw phy $HP2 interface add wlan2 type managed; hwphys
 }
 profile() { printf '{"id":"nsexp-a","roots":[],"namespaces":[{"mode":"managed","iface_display_name":"scana","phy":"%s","interface":"%s","security":null,"default_route":false,"namespace":"%s"}]}' "$1" "$2" "$NS"; }
